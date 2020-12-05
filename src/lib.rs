@@ -553,7 +553,7 @@ impl Model {
 
         // Now group loop relations such that each group shares no variables with any other group.
         // TODO: Identify relations which connect two loops but are not part of a loop.
-        let mut disjoint_loop_vars = DisjointSets::default();
+        let mut disjoint_loop_vars = DisjointSets::new();
         for common in reduced.keys() {
             let first = common.0[0];
             for v in common.0[1..].iter().copied() {
@@ -949,15 +949,21 @@ impl ModelEvaluation<'_> {
     }
 }
 
-#[derive(Default)]
-struct DisjointSets(HashMap<VariableId, (VariableId, u8)>);
+struct DisjointSets<V>(HashMap<V, (V, u8)>);
 
-impl DisjointSets {
-    fn find(&mut self, x: VariableId) -> VariableId {
+impl<V> DisjointSets<V>
+where
+    V: Copy + Eq + std::hash::Hash,
+{
+    fn new() -> Self {
+        DisjointSets(HashMap::new())
+    }
+
+    fn find(&mut self, x: V) -> V {
         self.find_rank(x).0
     }
 
-    fn find_rank(&mut self, mut x: VariableId) -> (VariableId, u8) {
+    fn find_rank(&mut self, mut x: V) -> (V, u8) {
         let mut parent = *self.0.entry(x).or_insert((x, 0));
         while x != parent.0 {
             let grandparent = self.0[&parent.0];
@@ -968,7 +974,7 @@ impl DisjointSets {
         parent
     }
 
-    fn union(&mut self, a: VariableId, b: VariableId) {
+    fn union(&mut self, a: V, b: V) {
         let mut a = self.find_rank(a);
         let mut b = self.find_rank(b);
 
