@@ -920,13 +920,23 @@ impl ModelEvaluation<'_> {
     }
 
     pub fn akaike_information_criterion(&self) -> f64 {
-        let ModelEvaluator { sample_size, bottom, .. } = self.evaluator;
-        bottom.akaike_information_criterion(*sample_size) - self.raw.akaike_information_criterion(*sample_size)
+        let ModelEvaluator {
+            sample_size,
+            bottom,
+            ..
+        } = self.evaluator;
+        bottom.akaike_information_criterion(*sample_size)
+            - self.raw.akaike_information_criterion(*sample_size)
     }
 
     pub fn bayesian_information_criterion(&self) -> f64 {
-        let ModelEvaluator { sample_size, bottom, .. } = self.evaluator;
-        bottom.bayesian_information_criterion(*sample_size) - self.raw.bayesian_information_criterion(*sample_size)
+        let ModelEvaluator {
+            sample_size,
+            bottom,
+            ..
+        } = self.evaluator;
+        bottom.bayesian_information_criterion(*sample_size)
+            - self.raw.bayesian_information_criterion(*sample_size)
     }
 
     pub fn top_alpha(&self) -> f64 {
