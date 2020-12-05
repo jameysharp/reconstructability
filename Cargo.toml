@@ -1,0 +1,12 @@
+[package]
+name = "reconstructability"
+version = "0.1.0"
+authors = ["Jamey Sharp <jamey@minilop.net>"]
+license = "AGPL-3.0-or-later"
+edition = "2018"
+
+[dependencies]
+smallvec = "1.5.0"
+lasso = "0.3.1"
+csv-core = "0.1.10"
+statrs = "0.13.0"
