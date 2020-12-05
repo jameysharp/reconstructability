@@ -1,21 +1,63 @@
-use lasso::{Key, MiniSpur};
+use lasso::{LargeSpur, MicroSpur, MiniSpur, Spur};
 use smallvec::SmallVec;
 use statrs::distribution::{ChiSquared, Univariate};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::f64::consts::LN_2;
 use std::iter::FromIterator;
-use std::mem::{size_of, swap};
+use std::mem::swap;
 
-pub type VariableId = MiniSpur;
+pub trait VariableId: Sized + Copy + std::hash::Hash + Ord {
+    /// SmallVec contains two `usize` fields which overlap with the inline vector, so variable sets
+    /// will have minimum size if this array occupies the same number of bytes.
+    ///
+    /// It can be declared like this for any implementation, or you can have the [`variable_id!`]
+    /// macro do it for you.
+    ///
+    /// ```ignore
+    /// use std::mem::size_of;
+    /// type SmallArray = [Self; 2 * size_of::<usize>() / size_of::<Self>()];
+    /// ```
+    type SmallArray: smallvec::Array<Item = Self> + Clone + std::fmt::Debug + std::hash::Hash + Ord;
+}
 
-// SmallVec contains two `usize` fields which overlap with the inline vector, so this size is the
-// biggest the inline vector can be without making SmallVec any bigger.
+#[macro_export]
+macro_rules! variable_id {
+    ($testname:ident, $($t:ty),*) => {
+        $(
+            impl $crate::VariableId for $t {
+                type SmallArray = [
+                    Self;
+                    2 * ::std::mem::size_of::<usize>() / ::std::mem::size_of::<Self>()
+                ];
+            }
+        )*
+
+        #[cfg(test)]
+        #[test]
+        fn $testname() {
+            use $crate::VariableSet;
+            use smallvec::SmallVec;
+            use std::mem::size_of;
+            $(
+                assert_eq!(
+                    size_of::<VariableSet<$t>>(),
+                    size_of::<SmallVec<[(); 0]>>()
+                );
+            )*
+        }
+    };
+}
+
+variable_id![lasso_id_size, LargeSpur, Spur, MiniSpur, MicroSpur];
+variable_id![unsigned_id_size, u8, u16, u32, u64, usize];
+variable_id![signed_id_size, i8, i16, i32, i64, isize];
+
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct VariableSet(SmallVec<[VariableId; 2 * size_of::<usize>() / size_of::<VariableId>()]>);
+pub struct VariableSet<V: VariableId>(SmallVec<V::SmallArray>);
 
-impl VariableSet {
-    pub fn new(ids: &[VariableId]) -> Self {
+impl<V: VariableId> VariableSet<V> {
+    pub fn new(ids: &[V]) -> Self {
         let mut v = SmallVec::from_slice(ids);
         v.sort_unstable();
         VariableSet(v)
@@ -26,33 +68,27 @@ impl VariableSet {
     }
 
     /// ```
-    /// use lasso::Rodeo;
     /// use reconstructability::VariableSet;
     ///
-    /// let mut rodeo = Rodeo::new();
-    /// let a = rodeo.get_or_intern_static("a");
-    /// let b = rodeo.get_or_intern_static("b");
-    /// let c = rodeo.get_or_intern_static("c");
+    /// let abc = VariableSet::new(&[2, 3, 1]);
+    /// let ab = VariableSet::new(&[1, 2]);
+    /// let ac = VariableSet::new(&[1, 3]);
+    /// let bc = VariableSet::new(&[2, 3]);
     ///
-    /// let abc = VariableSet::new(&[b, c, a]);
-    /// let ab = VariableSet::new(&[a, b]);
-    /// let ac = VariableSet::new(&[a, c]);
-    /// let bc = VariableSet::new(&[b, c]);
-    ///
-    /// assert_eq!(abc.intersection(&ab).collect::<Vec<_>>(), vec![a, b]);
-    /// assert_eq!(ab.intersection(&abc).collect::<Vec<_>>(), vec![a, b]);
-    /// assert_eq!(abc.intersection(&ac).collect::<Vec<_>>(), vec![a, c]);
-    /// assert_eq!(ac.intersection(&abc).collect::<Vec<_>>(), vec![a, c]);
-    /// assert_eq!(abc.intersection(&bc).collect::<Vec<_>>(), vec![b, c]);
-    /// assert_eq!(bc.intersection(&abc).collect::<Vec<_>>(), vec![b, c]);
-    /// assert_eq!(ab.intersection(&ac).collect::<Vec<_>>(), vec![a]);
-    /// assert_eq!(ac.intersection(&ab).collect::<Vec<_>>(), vec![a]);
-    /// assert_eq!(ab.intersection(&bc).collect::<Vec<_>>(), vec![b]);
-    /// assert_eq!(bc.intersection(&ab).collect::<Vec<_>>(), vec![b]);
-    /// assert_eq!(ac.intersection(&bc).collect::<Vec<_>>(), vec![c]);
-    /// assert_eq!(bc.intersection(&ac).collect::<Vec<_>>(), vec![c]);
+    /// assert_eq!(abc.intersection(&ab).collect::<Vec<_>>(), vec![1, 2]);
+    /// assert_eq!(ab.intersection(&abc).collect::<Vec<_>>(), vec![1, 2]);
+    /// assert_eq!(abc.intersection(&ac).collect::<Vec<_>>(), vec![1, 3]);
+    /// assert_eq!(ac.intersection(&abc).collect::<Vec<_>>(), vec![1, 3]);
+    /// assert_eq!(abc.intersection(&bc).collect::<Vec<_>>(), vec![2, 3]);
+    /// assert_eq!(bc.intersection(&abc).collect::<Vec<_>>(), vec![2, 3]);
+    /// assert_eq!(ab.intersection(&ac).collect::<Vec<_>>(), vec![1]);
+    /// assert_eq!(ac.intersection(&ab).collect::<Vec<_>>(), vec![1]);
+    /// assert_eq!(ab.intersection(&bc).collect::<Vec<_>>(), vec![2]);
+    /// assert_eq!(bc.intersection(&ab).collect::<Vec<_>>(), vec![2]);
+    /// assert_eq!(ac.intersection(&bc).collect::<Vec<_>>(), vec![3]);
+    /// assert_eq!(bc.intersection(&ac).collect::<Vec<_>>(), vec![3]);
     /// ```
-    pub fn intersection<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = VariableId> + 'a {
+    pub fn intersection<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = V> + 'a {
         let mut ys = other.0.iter().copied();
         let mut maybe_y = ys.next();
         self.0.iter().copied().filter(move |x| {
@@ -70,23 +106,17 @@ impl VariableSet {
     }
 
     /// ```
-    /// use lasso::Rodeo;
     /// use reconstructability::VariableSet;
     ///
-    /// let mut rodeo = Rodeo::new();
-    /// let a = rodeo.get_or_intern_static("a");
-    /// let b = rodeo.get_or_intern_static("b");
-    /// let c = rodeo.get_or_intern_static("c");
+    /// let all = vec![1, 2, 3];
     ///
-    /// let all = vec![a, b, c];
-    ///
-    /// let abc = VariableSet::new(&[b, c, a]);
-    /// let ab = VariableSet::new(&[a, b]);
-    /// let ac = VariableSet::new(&[a, c]);
-    /// let bc = VariableSet::new(&[b, c]);
-    /// let a = VariableSet::new(&[a]);
-    /// let b = VariableSet::new(&[b]);
-    /// let c = VariableSet::new(&[c]);
+    /// let abc = VariableSet::new(&[2, 3, 1]);
+    /// let ab = VariableSet::new(&[1, 2]);
+    /// let ac = VariableSet::new(&[1, 3]);
+    /// let bc = VariableSet::new(&[2, 3]);
+    /// let a = VariableSet::new(&[1]);
+    /// let b = VariableSet::new(&[2]);
+    /// let c = VariableSet::new(&[3]);
     ///
     /// let subsets = [
     ///     (&abc, &ab), (&abc, &ac), (&abc, &bc),
@@ -99,7 +129,7 @@ impl VariableSet {
     ///     assert_eq!(&y.union(x).collect::<Vec<_>>(), &all);
     /// }
     /// ```
-    pub fn union<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = VariableId> + 'a {
+    pub fn union<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = V> + 'a {
         let mut xs = self.0.iter().copied().peekable();
         let mut ys = other.0.iter().copied().peekable();
         std::iter::from_fn(move || match (xs.peek().copied(), ys.peek().copied()) {
@@ -122,25 +152,23 @@ impl VariableSet {
     }
 }
 
-impl std::fmt::Debug for VariableSet {
+impl<V: VariableId + std::fmt::Debug> std::fmt::Debug for VariableSet<V> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_set()
-            .entries(self.0.iter().map(|v| unsafe { v.into_usize() }))
-            .finish()
+        f.debug_set().entries(self.0.iter()).finish()
     }
 }
 
-impl FromIterator<VariableId> for VariableSet {
-    fn from_iter<I: IntoIterator<Item = VariableId>>(iter: I) -> Self {
+impl<V: VariableId> FromIterator<V> for VariableSet<V> {
+    fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
         let mut v = SmallVec::from_iter(iter);
         v.sort();
         VariableSet(v)
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Table {
-    pub raw_data: HashMap<VariableSet, f64>,
+#[derive(Clone, PartialEq)]
+pub struct Table<V: VariableId> {
+    pub raw_data: HashMap<VariableSet<V>, f64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -150,7 +178,17 @@ pub struct TableSummary {
     pub sample_size: f64,
 }
 
-impl Table {
+impl<V> std::fmt::Debug for Table<V>
+where
+    V: VariableId,
+    VariableSet<V>: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.raw_data.iter()).finish()
+    }
+}
+
+impl<V: VariableId> Table<V> {
     pub fn new() -> Self {
         Table {
             raw_data: HashMap::new(),
@@ -163,7 +201,7 @@ impl Table {
         }
     }
 
-    pub fn add_cell(&mut self, state: VariableSet, count: f64) -> &mut Self {
+    pub fn add_cell(&mut self, state: VariableSet<V>, count: f64) -> &mut Self {
         if count > 0.0 {
             *self.raw_data.entry(state).or_insert(0.0) += count;
         }
@@ -171,16 +209,11 @@ impl Table {
     }
 
     /// ```
-    /// use lasso::Rodeo;
     /// use reconstructability::{Table, VariableSet};
     ///
-    /// let mut rodeo = Rodeo::new();
-    /// let a = rodeo.get_or_intern_static("a");
-    /// let b = rodeo.get_or_intern_static("b");
-    ///
-    /// let ab = VariableSet::new(&[a, b]);
-    /// let a = VariableSet::new(&[a]);
-    /// let b = VariableSet::new(&[b]);
+    /// let ab = VariableSet::new(&[1, 2]);
+    /// let a = VariableSet::new(&[1]);
+    /// let b = VariableSet::new(&[2]);
     /// let nil = VariableSet::new(&[]);
     ///
     /// let mut table = Table::new();
@@ -195,7 +228,7 @@ impl Table {
     /// let project_b = table.project(&b);
     /// assert_eq!(project_b, *Table::new().add_cell(nil.clone(), 0.375).add_cell(b.clone(), 0.625));
     /// ```
-    pub fn project(&self, on: &VariableSet) -> Table {
+    pub fn project(&self, on: &VariableSet<V>) -> Table<V> {
         // In theory, there are 2**on.len() states in this projected table, so we can preallocate
         // storage for them. But don't preallocate too much capacity; the input data is typically
         // sparse so it may be that many of the possible projected states are empty. Worse, the number
@@ -213,16 +246,11 @@ impl Table {
     }
 
     /// ```
-    /// use lasso::Rodeo;
     /// use reconstructability::{Table, VariableSet};
     ///
-    /// let mut rodeo = Rodeo::new();
-    /// let a = rodeo.get_or_intern_static("a");
-    /// let b = rodeo.get_or_intern_static("b");
-    ///
-    /// let ab = VariableSet::new(&[a, b]);
-    /// let a = VariableSet::new(&[a]);
-    /// let b = VariableSet::new(&[b]);
+    /// let ab = VariableSet::new(&[1, 2]);
+    /// let a = VariableSet::new(&[1]);
+    /// let b = VariableSet::new(&[2]);
     /// let nil = VariableSet::new(&[]);
     ///
     /// let table = Table::new()
@@ -241,7 +269,7 @@ impl Table {
     ///     .add_cell(ab.clone(), 5.25)
     /// );
     /// ```
-    pub fn compose_with(&self, other: &Self) -> Table {
+    pub fn compose_with(&self, other: &Self) -> Table<V> {
         let mut composition = Table::with_capacity(self.raw_data.len() * other.raw_data.len());
         let mut sample_size = 0.0;
 
@@ -264,12 +292,7 @@ impl Table {
     }
 
     /// ```
-    /// use lasso::Rodeo;
     /// use reconstructability::{Table, VariableSet};
-    ///
-    /// let mut rodeo = Rodeo::new();
-    /// let a = rodeo.get_or_intern_static("a");
-    /// let b = rodeo.get_or_intern_static("b");
     ///
     /// let mut builder = Table::new();
     /// assert_eq!(builder.summary().uncertainty, 0.0);
@@ -277,11 +300,11 @@ impl Table {
     /// builder.add_cell(VariableSet::new(&[]), 1.0);
     /// assert_eq!(builder.summary().uncertainty, 0.0);
     ///
-    /// builder.add_cell(VariableSet::new(&[a]), 1.0);
+    /// builder.add_cell(VariableSet::new(&[1]), 1.0);
     /// assert_eq!(builder.summary().uncertainty, 1.0);
     ///
-    /// builder.add_cell(VariableSet::new(&[b]), 1.0);
-    /// builder.add_cell(VariableSet::new(&[a, b]), 1.0);
+    /// builder.add_cell(VariableSet::new(&[2]), 1.0);
+    /// builder.add_cell(VariableSet::new(&[1, 2]), 1.0);
     /// assert_eq!(builder.summary().uncertainty, 2.0);
     /// ```
     pub fn summary(&self) -> TableSummary {
@@ -307,18 +330,18 @@ impl Table {
 
 /// A model is a set of variable-sets, where no variable-set is a subset of any other in the model.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Model {
-    relations: Vec<VariableSet>,
+pub struct Model<V: VariableId> {
+    relations: Vec<VariableSet<V>>,
 }
 
-impl Model {
-    pub fn new() -> Model {
+impl<V: VariableId> Model<V> {
+    pub fn new() -> Self {
         Model {
             relations: Vec::new(),
         }
     }
 
-    pub fn independence(variables: &VariableSet) -> Model {
+    pub fn independence(variables: &VariableSet<V>) -> Self {
         Model {
             relations: variables
                 .0
@@ -331,21 +354,16 @@ impl Model {
     // This implementation relies on the relations being sorted in descending order by number of
     // variables. Break ties by VariableSet's natural order so that there's a canonical order and
     // derived Eq/Ord/Hash just work.
-    fn sort_by(a: &VariableSet, b: &VariableSet) -> Ordering {
+    fn sort_by(a: &VariableSet<V>, b: &VariableSet<V>) -> Ordering {
         b.len().cmp(&a.len()).then_with(|| a.cmp(b))
     }
 
     /// ```
-    /// use lasso::Rodeo;
     /// use reconstructability::{Model, VariableSet};
     ///
-    /// let mut rodeo = Rodeo::new();
-    /// let a = rodeo.get_or_intern_static("a");
-    /// let b = rodeo.get_or_intern_static("b");
-    ///
-    /// let ab = VariableSet::new(&[a, b]);
-    /// let a = VariableSet::new(&[a]);
-    /// let b = VariableSet::new(&[b]);
+    /// let ab = VariableSet::new(&[1, 2]);
+    /// let a = VariableSet::new(&[1]);
+    /// let b = VariableSet::new(&[2]);
     /// let nil = VariableSet::new(&[]);
     ///
     /// assert_eq!(
@@ -373,7 +391,7 @@ impl Model {
     ///     Model::new().add_relation(ab.clone())
     /// );
     /// ```
-    pub fn add_relation(&mut self, relation: VariableSet) -> &mut Model {
+    pub fn add_relation(&mut self, relation: VariableSet<V>) -> &mut Self {
         let len = relation.len();
 
         // If binary search finds the specified relation, then we don't need to add it again.
@@ -402,23 +420,17 @@ impl Model {
     }
 
     /// ```
-    /// use lasso::Rodeo;
     /// use reconstructability::{Model, VariableSet};
     ///
-    /// let mut rodeo = Rodeo::new();
-    /// let a = rodeo.get_or_intern_static("a");
-    /// let b = rodeo.get_or_intern_static("b");
-    /// let c = rodeo.get_or_intern_static("c");
-    ///
     /// let mut abc = Model::new();
-    /// abc.add_relation(VariableSet::new(&[a, b, c]));
+    /// abc.add_relation(VariableSet::new(&[1, 2, 3]));
     ///
-    /// let ab = VariableSet::new(&[a, b]);
-    /// let ac = VariableSet::new(&[a, c]);
-    /// let bc = VariableSet::new(&[b, c]);
-    /// let a = VariableSet::new(&[a]);
-    /// let b = VariableSet::new(&[b]);
-    /// let c = VariableSet::new(&[c]);
+    /// let ab = VariableSet::new(&[1, 2]);
+    /// let ac = VariableSet::new(&[1, 3]);
+    /// let bc = VariableSet::new(&[2, 3]);
+    /// let a = VariableSet::new(&[1]);
+    /// let b = VariableSet::new(&[2]);
+    /// let c = VariableSet::new(&[3]);
     ///
     /// let mut df1 = abc.less_complex();
     /// let mut ab_ac_bc = Model::new();
@@ -427,7 +439,7 @@ impl Model {
     /// assert_eq!(df1.next(), Some(ab_ac_bc));
     /// assert_eq!(df1.next(), None);
     /// ```
-    pub fn less_complex(&self) -> impl Iterator<Item = Model> + '_ {
+    pub fn less_complex(&self) -> impl Iterator<Item = Self> + '_ {
         // A relation of only one variable can't get any simpler, but any other relation in this
         // model is fair game. If all the relations are single-variable, this is the independence
         // model and has no simpler models.
@@ -466,7 +478,7 @@ impl Model {
         })
     }
 
-    pub fn plan(&self) -> QueryPlan {
+    pub fn plan(&self) -> QueryPlan<V> {
         let mut reduced = self
             .relations
             .iter()
@@ -583,12 +595,12 @@ impl Model {
 }
 
 #[derive(Clone, Debug)]
-pub struct QueryPlan {
-    loops: Vec<Vec<VariableSet>>,
-    loopless: Vec<(VariableSet, usize)>,
+pub struct QueryPlan<V: VariableId> {
+    loops: Vec<Vec<VariableSet<V>>>,
+    loopless: Vec<(VariableSet<V>, usize)>,
 }
 
-impl QueryPlan {
+impl<V: VariableId> QueryPlan<V> {
     pub fn degrees_of_freedom(&self) -> f64 {
         let mut total = 0.0;
 
@@ -614,7 +626,7 @@ impl QueryPlan {
         total
     }
 
-    pub fn uncertainty(&self, table: &Table) -> f64 {
+    pub fn uncertainty(&self, table: &Table<V>) -> f64 {
         let mut uncertainty = 0.0;
 
         let mut projections = Vec::new();
@@ -642,7 +654,7 @@ impl QueryPlan {
         !self.loops.is_empty()
     }
 
-    pub fn loopless_factors(&self) -> impl Iterator<Item = (&VariableSet, f64)> {
+    pub fn loopless_factors(&self) -> impl Iterator<Item = (&VariableSet<V>, f64)> {
         self.loopless.iter().map(|(relation, duplicates)| {
             (
                 relation,
@@ -656,21 +668,21 @@ impl QueryPlan {
     }
 }
 
-fn iterative_proportional_fit(
-    projections: &[(&VariableSet, Table)],
+fn iterative_proportional_fit<V: VariableId>(
+    projections: &[(&VariableSet<V>, Table<V>)],
     max_iter: u8,
     max_error: f64,
-) -> Table {
-    fn init<'a>(
-        result: &mut Vec<(Vec<&'a VariableSet>, f64)>,
-        keys: &mut Vec<&'a VariableSet>,
-        margins: &'a [(&'a VariableSet, Table)],
-        seen: &VariableSet,
-        state: VariableSet,
+) -> Table<V> {
+    fn init<'a, V: VariableId>(
+        result: &mut Vec<(Vec<&'a VariableSet<V>>, f64)>,
+        keys: &mut Vec<&'a VariableSet<V>>,
+        margins: &'a [(&'a VariableSet<V>, Table<V>)],
+        seen: &VariableSet<V>,
+        state: VariableSet<V>,
     ) {
         if let Some(((relation, margin), rest)) = margins.split_first() {
-            let common: VariableSet = seen.intersection(relation).collect();
-            let seen: VariableSet = seen.union(relation).collect();
+            let common: VariableSet<V> = seen.intersection(relation).collect();
+            let seen: VariableSet<V> = seen.union(relation).collect();
 
             for current in margin.raw_data.keys() {
                 if common.intersection(current).eq(common.intersection(&state)) {
@@ -832,15 +844,15 @@ impl RawEvaluation {
     }
 }
 
-pub struct ModelEvaluator<'a> {
-    data: &'a Table,
+pub struct ModelEvaluator<'a, V: VariableId> {
+    data: &'a Table<V>,
     sample_size: f64,
     top: RawEvaluation,
     bottom: RawEvaluation,
 }
 
-impl ModelEvaluator<'_> {
-    pub fn new<'a>(data: &'a Table, variables: &VariableSet) -> ModelEvaluator<'a> {
+impl<V: VariableId> ModelEvaluator<'_, V> {
+    pub fn new<'a>(data: &'a Table<V>, variables: &VariableSet<V>) -> ModelEvaluator<'a, V> {
         let summary = data.summary();
 
         let bottom = Model::independence(variables);
@@ -864,7 +876,7 @@ impl ModelEvaluator<'_> {
         self.sample_size
     }
 
-    pub fn evaluate<'a>(&'a self, model: &Model) -> ModelEvaluation<'a> {
+    pub fn evaluate<'a>(&'a self, model: &Model<V>) -> ModelEvaluation<'a, V> {
         if model.relations.len() == 1 {
             ModelEvaluation {
                 evaluator: self,
@@ -888,12 +900,12 @@ impl ModelEvaluator<'_> {
     }
 }
 
-pub struct ModelEvaluation<'a> {
-    evaluator: &'a ModelEvaluator<'a>,
+pub struct ModelEvaluation<'a, V: VariableId> {
+    evaluator: &'a ModelEvaluator<'a, V>,
     raw: RawEvaluation,
 }
 
-impl ModelEvaluation<'_> {
+impl<V: VariableId> ModelEvaluation<'_, V> {
     pub fn degrees_of_freedom(&self) -> f64 {
         self.raw.degrees_of_freedom
     }
@@ -1002,15 +1014,5 @@ where
             a.1 += 1;
             self.0.insert(a.0, a);
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn variableset_size() {
-        assert_eq!(size_of::<VariableSet>(), size_of::<SmallVec<[(); 0]>>());
     }
 }

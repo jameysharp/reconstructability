@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use std::io;
 use std::str;
 
-fn load_data<I: io::Read>(mut input: I) -> io::Result<(RodeoResolver<VariableId>, Table)> {
+fn load_data<I: io::Read, V: VariableId + Default + lasso::Key>(
+    mut input: I,
+) -> io::Result<(RodeoResolver<V>, Table<V>)> {
     let mut inputbuf = [0; 16384];
     let mut fieldbuf = [0; 1024];
     let mut fieldlen = 0;
@@ -72,7 +74,8 @@ fn load_data<I: io::Read>(mut input: I) -> io::Result<(RodeoResolver<VariableId>
 fn main() -> io::Result<()> {
     let (resolver, table) = load_data(io::stdin().lock())?;
 
-    let variables: VariableSet = resolver.iter().map(|(variable, _)| variable).collect();
+    let variables: VariableSet<lasso::MiniSpur> =
+        resolver.iter().map(|(variable, _)| variable).collect();
     let evaluator = ModelEvaluator::new(&table, &variables);
 
     println!("data: {:?}", table);
