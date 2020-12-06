@@ -21,7 +21,7 @@ use statrs::distribution::{ChiSquared, Univariate};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::f64::consts::LN_2;
-use std::iter::FromIterator;
+use std::iter;
 use std::mem::swap;
 
 /// Types which can be used in a [`VariableSet`].
@@ -176,7 +176,7 @@ impl<V: VariableId> VariableSet<V> {
     pub fn union<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = V> + 'a {
         let mut xs = self.0.iter().copied().peekable();
         let mut ys = other.0.iter().copied().peekable();
-        std::iter::from_fn(move || match (xs.peek().copied(), ys.peek().copied()) {
+        iter::from_fn(move || match (xs.peek().copied(), ys.peek().copied()) {
             (None, None) => None,
             (Some(_), None) => xs.next(),
             (None, Some(_)) => ys.next(),
@@ -230,7 +230,7 @@ impl<V: VariableId + std::fmt::Debug> std::fmt::Debug for VariableSet<V> {
     }
 }
 
-impl<V: VariableId> FromIterator<V> for VariableSet<V> {
+impl<V: VariableId> iter::FromIterator<V> for VariableSet<V> {
     /// Creates a variable set containing the specified variables.
     ///
     /// It's okay if the provided iterator contains duplicates.
@@ -288,7 +288,7 @@ pub struct TableSummary {
     pub sample_size: f64,
 }
 
-impl FromIterator<f64> for TableSummary {
+impl iter::FromIterator<f64> for TableSummary {
     /// Creates a summary for a table whose non-zero cells are provided by the given iterator.
     fn from_iter<I: IntoIterator<Item = f64>>(iter: I) -> Self {
         let mut summary = TableSummary {
@@ -590,7 +590,9 @@ impl<V: VariableId> Model<V> {
     /// assert_eq!(df1.next(), Some(ab_ac_bc));
     /// assert_eq!(df1.next(), None);
     /// ```
-    pub fn less_complex(&self) -> impl Iterator<Item = Self> + '_ {
+    pub fn less_complex(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = Self> + ExactSizeIterator + iter::FusedIterator + '_ {
         // A relation of only one variable can't get any simpler, but any other relation in this
         // model is fair game. If all the relations are single-variable, this is the independence
         // model and has no simpler models.
