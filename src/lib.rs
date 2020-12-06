@@ -107,6 +107,24 @@ impl<V: VariableId> VariableSet<V> {
         self.0.len()
     }
 
+    /// Returns an iterator over the variables which appear in this set.
+    ///
+    /// ```
+    /// use reconstructability::VariableSet;
+    ///
+    /// let abc = VariableSet::new(&[2, 3, 1]);
+    /// let mut it = abc.iter();
+    /// assert_eq!(it.next(), Some(1));
+    /// assert_eq!(it.next(), Some(2));
+    /// assert_eq!(it.next(), Some(3));
+    /// assert_eq!(it.next(), None);
+    /// ```
+    pub fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = V> + ExactSizeIterator + iter::FusedIterator + '_ {
+        self.0.iter().copied()
+    }
+
     /// Returns an iterator over the variables which appear in both sets.
     ///
     /// ```
@@ -489,6 +507,27 @@ impl<V: VariableId> Model<V> {
                 .map(|variable| VariableSet::new(std::slice::from_ref(variable)))
                 .collect(),
         }
+    }
+
+    /// Returns an iterator over the relations which appear in this model.
+    ///
+    /// ```
+    /// use reconstructability::{Model, VariableSet};
+    ///
+    /// let mut model = Model::new();
+    /// model.add_relation(VariableSet::new(&[2]));
+    /// model.add_relation(VariableSet::new(&[3, 1]));
+    ///
+    /// let mut it = model.iter();
+    /// assert_eq!(it.next(), Some(&VariableSet::new(&[1, 3])));
+    /// assert_eq!(it.next(), Some(&VariableSet::new(&[2])));
+    /// assert_eq!(it.next(), None);
+    /// ```
+    pub fn iter(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &VariableSet<V>> + ExactSizeIterator + iter::FusedIterator + '_
+    {
+        self.relations.iter()
     }
 
     // This implementation relies on the relations being sorted in descending order by number of
