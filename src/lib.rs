@@ -178,6 +178,25 @@ pub struct TableSummary {
     pub sample_size: f64,
 }
 
+impl FromIterator<f64> for TableSummary {
+    /// Creates a summary for a table whose non-zero cells are provided by the given iterator.
+    fn from_iter<I: IntoIterator<Item = f64>>(iter: I) -> Self {
+        let mut summary = TableSummary {
+            uncertainty: 0.0,
+            sample_size: 0.0,
+        };
+        for count in iter {
+            summary.uncertainty -= count * count.log2();
+            summary.sample_size += count;
+        }
+        if summary.sample_size > 0.0 {
+            summary.uncertainty /= summary.sample_size;
+            summary.uncertainty += summary.sample_size.log2();
+        }
+        summary
+    }
+}
+
 impl<V> std::fmt::Debug for Table<V>
 where
     V: VariableId,
@@ -308,19 +327,7 @@ impl<V: VariableId> Table<V> {
     /// assert_eq!(builder.summary().uncertainty, 2.0);
     /// ```
     pub fn summary(&self) -> TableSummary {
-        let mut summary = TableSummary {
-            uncertainty: 0.0,
-            sample_size: 0.0,
-        };
-        for count in self.raw_data.values() {
-            summary.uncertainty -= count * count.log2();
-            summary.sample_size += count;
-        }
-        if summary.sample_size > 0.0 {
-            summary.uncertainty /= summary.sample_size;
-            summary.uncertainty += summary.sample_size.log2();
-        }
-        summary
+        self.raw_data.values().copied().collect()
     }
 
     pub fn shrink_to_fit(&mut self) {
@@ -847,33 +854,69 @@ impl RawEvaluation {
 pub struct ModelEvaluator<'a, V: VariableId> {
     data: &'a Table<V>,
     sample_size: f64,
+    variables: VariableSet<V>,
     top: RawEvaluation,
     bottom: RawEvaluation,
 }
 
 impl<V: VariableId> ModelEvaluator<'_, V> {
-    pub fn new<'a>(data: &'a Table<V>, variables: &VariableSet<V>) -> ModelEvaluator<'a, V> {
-        let summary = data.summary();
+    pub fn new<'a>(data: &'a Table<V>) -> ModelEvaluator<'a, V> {
+        let mut variables = HashMap::new();
 
-        let bottom = Model::independence(variables);
-        let bottom_plan = bottom.plan();
+        let summary: TableSummary = data
+            .raw_data
+            .iter()
+            .map(|(relation, count)| {
+                // While summarizing the original data, also count how many observations each
+                // variable occurs in. This is like computing each single-variable projection for
+                // the independence model, but stores only the positive counts and makes only one
+                // pass over the data.
+                for variable in relation.0.iter() {
+                    *variables.entry(*variable).or_insert(0.0) += *count;
+                }
+                *count
+            })
+            .collect();
+
+        let mut bottom_uncertainty = 0.0;
+        let variables: VariableSet<V> = variables
+            .into_iter()
+            .map(|(variable, count)| {
+                // Now that we have all the single-variable projections, convert to probabilities
+                // and also find the complementary probability for each variable.
+                let p = count / summary.sample_size;
+                let q = 1.0 - p;
+
+                // Thought for later: If q is very close to 0, we could omit this variable from
+                // analysis because it's always present and so has no uncertainty.
+                bottom_uncertainty -= p * p.log2() + q * q.log2();
+                variable
+            })
+            .collect();
+
+        let variable_count = variables.0.len() as f64;
 
         ModelEvaluator {
             data,
             sample_size: summary.sample_size,
+            variables,
             top: RawEvaluation {
                 uncertainty: summary.uncertainty,
-                degrees_of_freedom: (variables.0.len() as f64).exp2() - 1.0,
+                degrees_of_freedom: variable_count.exp2() - 1.0,
             },
             bottom: RawEvaluation {
-                uncertainty: bottom_plan.uncertainty(&data),
-                degrees_of_freedom: variables.0.len() as f64,
+                uncertainty: bottom_uncertainty,
+                degrees_of_freedom: variable_count,
             },
         }
     }
 
     pub fn sample_size(&self) -> f64 {
         self.sample_size
+    }
+
+    pub fn variables(&self) -> &VariableSet<V> {
+        &self.variables
     }
 
     pub fn evaluate<'a>(&'a self, model: &Model<V>) -> ModelEvaluation<'a, V> {

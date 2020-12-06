@@ -72,17 +72,14 @@ fn load_data<I: io::Read, V: VariableId + Default + lasso::Key>(
 }
 
 fn main() -> io::Result<()> {
-    let (resolver, table) = load_data(io::stdin().lock())?;
-
-    let variables: VariableSet<lasso::MiniSpur> =
-        resolver.iter().map(|(variable, _)| variable).collect();
-    let evaluator = ModelEvaluator::new(&table, &variables);
+    let (_resolver, table) = load_data::<_, lasso::MiniSpur>(io::stdin().lock())?;
+    let evaluator = ModelEvaluator::new(&table);
 
     println!("data: {:?}", table);
     println!("  sample size: {}", evaluator.sample_size());
 
     let mut saturated = Model::new();
-    saturated.add_relation(variables);
+    saturated.add_relation(evaluator.variables().clone());
 
     let mut current_layer = vec![saturated];
     let mut next_layer = HashSet::new();
