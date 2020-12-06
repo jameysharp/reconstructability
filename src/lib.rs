@@ -1,3 +1,20 @@
+#![warn(missing_docs)]
+
+//! This crate provides an implementation of Reconstructability Analysis, as described by these
+//! papers:
+//!
+//! - Zwick, [An Overview of Reconstructability Analysis][overview], 2004
+//! - Zwick, [Wholes and Parts in General Systems Methodology][wholes], 2001
+//!
+//! [overview]: https://pdxscholar.library.pdx.edu/cgi/viewcontent.cgi?article=1022&context=sysc_fac
+//! [wholes]: https://pdxscholar.library.pdx.edu/cgi/viewcontent.cgi?article=1026&context=sysc_fac
+//!
+//! Where those papers didn't describe some details, I also read the existing C++ implementation,
+//! [OCCAM][], and the [OCCAM manual][].
+//!
+//! [OCCAM]: https://github.com/occam-ra/occam
+//! [OCCAM manual]: https://occam.readthedocs.io/en/latest/
+
 use lasso::{LargeSpur, MicroSpur, MiniSpur, Spur};
 use smallvec::SmallVec;
 use statrs::distribution::{ChiSquared, Univariate};
@@ -7,6 +24,7 @@ use std::f64::consts::LN_2;
 use std::iter::FromIterator;
 use std::mem::swap;
 
+/// Types which can be used in a [`VariableSet`].
 pub trait VariableId: Sized + Copy + std::hash::Hash + Ord {
     /// SmallVec contains two `usize` fields which overlap with the inline vector, so variable sets
     /// will have minimum size if this array occupies the same number of bytes.
@@ -21,6 +39,19 @@ pub trait VariableId: Sized + Copy + std::hash::Hash + Ord {
     type SmallArray: smallvec::Array<Item = Self> + Clone + std::fmt::Debug + std::hash::Hash + Ord;
 }
 
+/// Generates implementations of the [`VariableId`] trait which set the associated `SmallArray`
+/// type to the biggest array that will fit within a [`SmallVec`][smallvec::SmallVec]'s minimum
+/// size.
+///
+/// It also generates a test with the given `$testname` that checks that the generated definition
+/// is as small as the smallest `SmallVec`.
+///
+/// For example, this library provides implementations for the basic unsigned integer types using
+/// this declaration:
+///
+/// ```ignore
+/// variable_id![unsigned_id_size, u8, u16, u32, u64, usize];
+/// ```
 #[macro_export]
 macro_rules! variable_id {
     ($testname:ident, $($t:ty),*) => {
@@ -53,20 +84,31 @@ variable_id![lasso_id_size, LargeSpur, Spur, MiniSpur, MicroSpur];
 variable_id![unsigned_id_size, u8, u16, u32, u64, usize];
 variable_id![signed_id_size, i8, i16, i32, i64, isize];
 
+/// A set of variables.
+///
+/// This implementation avoids heap allocations for sets containing a number of variables smaller
+/// than the length of [`VariableId::SmallArray`].
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct VariableSet<V: VariableId>(SmallVec<V::SmallArray>);
 
 impl<V: VariableId> VariableSet<V> {
+    /// Creates a variable set containing the specified variables.
+    ///
+    /// It's okay if the provided slice contains duplicates.
     pub fn new(ids: &[V]) -> Self {
         let mut v = SmallVec::from_slice(ids);
         v.sort_unstable();
+        v.dedup();
         VariableSet(v)
     }
 
+    /// The number of variables in the set.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns an iterator over the variables which appear in both sets.
+    ///
     /// ```
     /// use reconstructability::VariableSet;
     ///
@@ -105,6 +147,8 @@ impl<V: VariableId> VariableSet<V> {
         })
     }
 
+    /// Returns an iterator over the variables which appear in either set.
+    ///
     /// ```
     /// use reconstructability::VariableSet;
     ///
@@ -147,8 +191,36 @@ impl<V: VariableId> VariableSet<V> {
         })
     }
 
-    pub fn is_subset_of(&self, other: &Self) -> bool {
-        self.intersection(other).count() == self.len()
+    /// Returns `true` if `other` contains every variable that `self` does.
+    ///
+    /// ```
+    /// use reconstructability::VariableSet;
+    /// let nil = VariableSet::new(&[]);
+    /// let one = VariableSet::new(&[1]);
+    ///
+    /// assert!(nil.is_subset(&one));
+    /// assert!(nil.is_subset(&nil));
+    /// assert!(one.is_subset(&one));
+    /// assert!(!one.is_subset(&nil));
+    /// ```
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.len() <= other.len() && self.intersection(other).count() == self.len()
+    }
+
+    /// Returns `true` if `self` contains every variable that `other` does.
+    ///
+    /// ```
+    /// use reconstructability::VariableSet;
+    /// let nil = VariableSet::new(&[]);
+    /// let one = VariableSet::new(&[1]);
+    ///
+    /// assert!(!nil.is_superset(&one));
+    /// assert!(nil.is_superset(&nil));
+    /// assert!(one.is_superset(&one));
+    /// assert!(one.is_superset(&nil));
+    /// ```
+    pub fn is_superset(&self, other: &Self) -> bool {
+        other.is_subset(self)
     }
 }
 
@@ -159,22 +231,60 @@ impl<V: VariableId + std::fmt::Debug> std::fmt::Debug for VariableSet<V> {
 }
 
 impl<V: VariableId> FromIterator<V> for VariableSet<V> {
+    /// Creates a variable set containing the specified variables.
+    ///
+    /// It's okay if the provided iterator contains duplicates.
     fn from_iter<I: IntoIterator<Item = V>>(iter: I) -> Self {
         let mut v = SmallVec::from_iter(iter);
-        v.sort();
+        v.sort_unstable();
+        v.dedup();
         VariableSet(v)
     }
 }
 
+/// A sparse contingency table containing either frequencies or probabilities, which may come from
+/// either observed events or maximum-likelihood estimates.
+///
+/// Variables are assumed to be binary. That is, an event is in a variable's category if that
+/// variable appears in the variable-set key for that event, and not otherwise.
+///
+/// As the number of variables increase, odds are that the total number of observations is
+/// significantly less than the size of the possible state space. So this type uses a sparse
+/// representation, in which not all possible combinations of the variables need to be present in
+/// the table. Missing elements are treated as zero.
+///
+/// # Panics
+///
+/// Various methods may panic if any cell in the table is negative or zero.
 #[derive(Clone, PartialEq)]
 pub struct Table<V: VariableId> {
+    /// Each cell of the table is represented with a key identifying the set of variables which
+    /// were true for that group of observations, and a value which is the number of events which
+    /// were observed with that particular configuration of variables.
+    //
+    // Note: I considered using a HashMap to build a table (because we often need random access
+    // during construction), but then converting it into a Vec before using it because we almost
+    // always just need to iterate over all the cells in the table. However:
+    // - iterating over a HashMap is almost as fast as over a vector;
+    // - a HashMap is almost as small as a vector of key/value pairs, especially after calling
+    //   `shrink_to_fit`;
+    // - sometimes we still need random access;
+    // - keeping all tables in a single representation is just simpler.
     pub raw_data: HashMap<VariableSet<V>, f64>,
 }
 
+/// Summary statistics for a single [`Table`].
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct TableSummary {
+    /// The [Shannon entropy][] of the table, measured in bits. This is normalized to produce the
+    /// same result whether the table contains probabilities or frequencies.
+    ///
+    /// [Shannon entropy]: https://en.wikipedia.org/wiki/Entropy_(information_theory)
     pub uncertainty: f64,
+
+    /// The total count across all cells in the table. If this table contains probabilities, the
+    /// `sample_size` should be approximately 1.0.
     pub sample_size: f64,
 }
 
@@ -208,25 +318,38 @@ where
 }
 
 impl<V: VariableId> Table<V> {
+    /// Creates an empty table.
     pub fn new() -> Self {
         Table {
             raw_data: HashMap::new(),
         }
     }
 
+    /// Creates an empty table with the specified capacity.
+    ///
+    /// The table will be able to hold at least `capacity` elements without reallocating. If
+    /// `capacity` is 0, the table will not allocate.
     pub fn with_capacity(capacity: usize) -> Self {
         Table {
             raw_data: HashMap::with_capacity(capacity),
         }
     }
 
+    /// Add the given frequency or probability to the specified cell.
+    ///
+    /// If the cell had not previously been set, it's treated like it was 0.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if the count is not finite and positive.
     pub fn add_cell(&mut self, state: VariableSet<V>, count: f64) -> &mut Self {
-        if count > 0.0 {
-            *self.raw_data.entry(state).or_insert(0.0) += count;
-        }
+        assert!(count > 0.0 && count.is_finite());
+        *self.raw_data.entry(state).or_insert(0.0) += count;
         self
     }
 
+    /// Returns a new table that is the projection of this table on a smaller set of variables.
+    ///
     /// ```
     /// use reconstructability::{Table, VariableSet};
     ///
@@ -310,6 +433,8 @@ impl<V: VariableId> Table<V> {
         composition
     }
 
+    /// Compute a [`TableSummary`] over the current contents of this table.
+    ///
     /// ```
     /// use reconstructability::{Table, VariableSet};
     ///
@@ -330,24 +455,32 @@ impl<V: VariableId> Table<V> {
         self.raw_data.values().copied().collect()
     }
 
+    /// Shrinks the capacity of the table as much as possible.
+    ///
+    /// If you're going to access the contents of this table a lot, it's a good idea to call this
+    /// method after you finish constructing it but before you start using it.
     pub fn shrink_to_fit(&mut self) {
         self.raw_data.shrink_to_fit();
     }
 }
 
-/// A model is a set of variable-sets, where no variable-set is a subset of any other in the model.
+/// A model is a set of [`VariableSet`]s, called "relations", where no relation is a subset of any
+/// other in the same model.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Model<V: VariableId> {
     relations: Vec<VariableSet<V>>,
 }
 
 impl<V: VariableId> Model<V> {
+    /// Creates a new empty model.
     pub fn new() -> Self {
         Model {
             relations: Vec::new(),
         }
     }
 
+    /// For a given set of variables, creates the model which asserts that every variable is
+    /// independent of all the others.
     pub fn independence(variables: &VariableSet<V>) -> Self {
         Model {
             relations: variables
@@ -365,6 +498,9 @@ impl<V: VariableId> Model<V> {
         b.len().cmp(&a.len()).then_with(|| a.cmp(b))
     }
 
+    /// Adds a relation to this model if it is not a subset of an existing relation, and removes
+    /// relations which are a subset of this one.
+    ///
     /// ```
     /// use reconstructability::{Model, VariableSet};
     ///
@@ -410,12 +546,12 @@ impl<V: VariableId> Model<V> {
             let is_subset = self.relations[..insert_at]
                 .iter()
                 .take_while(|r| len < r.len())
-                .any(|r| relation.is_subset_of(r));
+                .any(|r| relation.is_subset(r));
             if !is_subset && len > 0 {
                 // If there are any smaller relations subsumed by this one, keep everything except
                 // those relations.
                 self.relations
-                    .retain(|r| len <= r.len() || !r.is_subset_of(&relation));
+                    .retain(|r| len <= r.len() || !r.is_subset(&relation));
 
                 // We retained everything of this relation's size or bigger, so at least up to the
                 // point of insertion nothing has changed and the position we found with binary
@@ -426,6 +562,14 @@ impl<V: VariableId> Model<V> {
         self
     }
 
+    /// An iterator producing every model which is one step down the lattice of structures.
+    ///
+    /// See the papers cited in the crate-level documentation for an explanation of the lattice of
+    /// structures.
+    ///
+    /// Because these models only support binary variables, every model returned has exactly one
+    /// degree of freedom less than the current model.
+    ///
     /// ```
     /// use reconstructability::{Model, VariableSet};
     ///
@@ -485,6 +629,25 @@ impl<V: VariableId> Model<V> {
         })
     }
 
+    /// Computes a plan for how to evaluate this model against the observed data.
+    ///
+    /// Every variable must contribute to the final result exactly once. When two relations in the
+    /// model include the same variable, the effect of such shared variables must be removed from
+    /// the result.
+    ///
+    /// Any set of relations which contains a loop must be jointly evaluated using an expensive
+    /// Iterative Proportional Fit algorithm. IPF is asymptotically expensive:
+    ///
+    /// - IPF needs `O(2^n)` space, where `n` is the number of variables.
+    /// - IPF needs `O(r*2^n)` time, where `r` is the number of relations in the model, which
+    ///   itself is `O(2^(2^n))` (I think?).
+    ///
+    /// By contrast, loopless models can be evaluated algebraically using only [`TableSummary`]s,
+    /// one for each relation and one for each of their shared subsets.
+    ///
+    /// So it's worth spending some time analyzing the model to find every relation which can be
+    /// evaluated algebraically, and only use IPF for the minimum possible group of relations that
+    /// require it.
     pub fn plan(&self) -> QueryPlan<V> {
         let mut reduced = self
             .relations
@@ -534,14 +697,14 @@ impl<V: VariableId> Model<V> {
                     if !subsumed {
                         match k.len().cmp(&relation.len()) {
                             Ordering::Less => {
-                                if k.is_subset_of(&relation) {
+                                if k.is_subset(&relation) {
                                     plan.append(v);
                                     plan.push((k.clone(), 1));
                                     return false;
                                 }
                             }
                             Ordering::Greater => {
-                                if relation.is_subset_of(k) {
+                                if relation.is_subset(k) {
                                     v.append(&mut plan);
                                     v.push((relation.clone(), 1 + duplicates));
                                     subsumed = true;
@@ -601,6 +764,7 @@ impl<V: VariableId> Model<V> {
     }
 }
 
+/// An evaluation plan produced by [`Model::plan`].
 #[derive(Clone, Debug)]
 pub struct QueryPlan<V: VariableId> {
     loops: Vec<Vec<VariableSet<V>>>,
@@ -608,6 +772,10 @@ pub struct QueryPlan<V: VariableId> {
 }
 
 impl<V: VariableId> QueryPlan<V> {
+    /// Computes the total degrees of freedom for the model that produced this plan.
+    ///
+    /// Asymptotically, this takes `O(r^2)` time, where `r` is the number of relations in the
+    /// model. But it's faster for the loopless subset of relations than for the loops.
     pub fn degrees_of_freedom(&self) -> f64 {
         let mut total = 0.0;
 
@@ -633,6 +801,13 @@ impl<V: VariableId> QueryPlan<V> {
         total
     }
 
+    /// Computes the [Shannon entropy][] for the model that produced this plan, measured in bits,
+    /// given a table of observed events.
+    ///
+    /// [Shannon entropy]: https://en.wikipedia.org/wiki/Entropy_(information_theory)
+    ///
+    /// This uses Iterated Proportional Fit for each loop, and algebraic results for the remaining
+    /// relations. See [`Model::plan`] for more details.
     pub fn uncertainty(&self, table: &Table<V>) -> f64 {
         let mut uncertainty = 0.0;
 
@@ -657,10 +832,19 @@ impl<V: VariableId> QueryPlan<V> {
         uncertainty
     }
 
+    /// Returns `true` if the model which produced this plan contained any loops between relations.
     pub fn has_loops(&self) -> bool {
         !self.loops.is_empty()
     }
 
+    /// An iterator over the relations in this plan which do not participate in any loops. Each
+    /// relation is returned with a weight indicating how many times each of its variables should
+    /// be counted.
+    ///
+    /// That weight will either be 1, or it will be a negative number for relations which are
+    /// shared subsets of other relations in the model. In the abscense of loops, summing over the
+    /// product of this weight with either uncertainty or degrees of freedom will give the correct
+    /// result for the model overall.
     pub fn loopless_factors(&self) -> impl Iterator<Item = (&VariableSet<V>, f64)> {
         self.loopless.iter().map(|(relation, duplicates)| {
             (
@@ -680,6 +864,14 @@ fn iterative_proportional_fit<V: VariableId>(
     max_iter: u8,
     max_error: f64,
 ) -> Table<V> {
+    // I've chosen to build up the result in a vector rather than a HashMap or Table because we
+    // need to iterate over it a bunch of times, so even the small overhead for iteration over a
+    // HashMap adds up.
+    //
+    // Also, due to the order in which `init` constructs the initial result vector, each table in
+    // `projections` will be accessed in its iteration order as long as we preserve order in
+    // `result`. That should improve cache locality.
+
     fn init<'a, V: VariableId>(
         result: &mut Vec<(Vec<&'a VariableSet<V>>, f64)>,
         keys: &mut Vec<&'a VariableSet<V>>,
@@ -851,6 +1043,8 @@ impl RawEvaluation {
     }
 }
 
+/// Holds the minimum state necessary for efficiently evaluating the quality of many candidate
+/// models for the same data.
 pub struct ModelEvaluator<'a, V: VariableId> {
     data: &'a Table<V>,
     sample_size: f64,
@@ -860,6 +1054,12 @@ pub struct ModelEvaluator<'a, V: VariableId> {
 }
 
 impl<V: VariableId> ModelEvaluator<'_, V> {
+    /// Creates an evaluator for the given observed data.
+    ///
+    /// This method precomputes statistics for the top and bottom models in the lattice of
+    /// structures, so that any other model can be quickly compared to those two references.
+    ///
+    /// It takes time proportional to number of cells in the data plus the number of variables.
     pub fn new<'a>(data: &'a Table<V>) -> ModelEvaluator<'a, V> {
         let mut variables = HashMap::new();
 
@@ -911,14 +1111,21 @@ impl<V: VariableId> ModelEvaluator<'_, V> {
         }
     }
 
+    /// Returns the total count across all cells in the original data.
+    ///
+    /// Most [`ModelEvaluation`] methods are only meaningful if this is a true sample size, rather
+    /// than being 1.0 because the table contains probabilities.
     pub fn sample_size(&self) -> f64 {
         self.sample_size
     }
 
+    /// Returns the set of variables that were observed in the original data.
     pub fn variables(&self) -> &VariableSet<V> {
         &self.variables
     }
 
+    /// Evaluates a model into a [`ModelEvaluation`] which can be used to compare this model to the
+    /// saturation and independence models.
     pub fn evaluate<'a>(&'a self, model: &Model<V>) -> ModelEvaluation<'a, V> {
         if model.relations.len() == 1 {
             ModelEvaluation {
@@ -943,37 +1150,70 @@ impl<V: VariableId> ModelEvaluator<'_, V> {
     }
 }
 
+/// Contains the result of evaluating one model against one set of observed data.
+///
+/// Every method on this type is constant-time (typically just a few floating-point multiplies) and
+/// values of this type use only a few words of memory.
 pub struct ModelEvaluation<'a, V: VariableId> {
     evaluator: &'a ModelEvaluator<'a, V>,
     raw: RawEvaluation,
 }
 
 impl<V: VariableId> ModelEvaluation<'_, V> {
+    /// Returns the number of degrees of freedom of this multinomial model.
     pub fn degrees_of_freedom(&self) -> f64 {
         self.raw.degrees_of_freedom
     }
 
+    /// Returns the number of degrees of freedom more that this model has compared to the
+    /// independence model.
     pub fn delta_degrees_of_freedom(&self) -> f64 {
         self.raw.degrees_of_freedom - self.evaluator.bottom.degrees_of_freedom
     }
 
+    /// Returns the [Shannon entropy][] for this model, measured in bits.
+    ///
+    /// [Shannon entropy]: https://en.wikipedia.org/wiki/Entropy_(information_theory)
+    ///
+    /// Every model from [`Model::less_complex`] will have more entropy than this one.
     pub fn uncertainty(&self) -> f64 {
         self.raw.uncertainty
     }
 
+    /// Returns the number of bits of constraint lost in this model compared to the original data.
+    ///
+    /// Every model from [`Model::less_complex`] will have more transmission than this one.
     pub fn transmission(&self) -> f64 {
         self.raw.uncertainty - self.evaluator.top.uncertainty
     }
 
+    /// Returns the constraint retained in this model, as a fraction of the constraint lost in the
+    /// independence model.
+    ///
+    /// Every model from [`Model::less_complex`] will have less information than this one.
     pub fn information(&self) -> f64 {
         let ModelEvaluator { bottom, top, .. } = self.evaluator;
         1.0 - self.transmission() / (bottom.uncertainty - top.uncertainty)
     }
 
+    /// Returns the natural logarithm of the [likelihood][] that the observed data was drawn from a
+    /// [multinomial distribution][] having the parameters of this model.
+    ///
+    /// [likelihood]: https://en.wikipedia.org/wiki/Likelihood_function
+    /// [multinomial distribution]: https://en.wikipedia.org/wiki/Multinomial_distribution
+    ///
+    /// Every model from [`Model::less_complex`] will be less likely than this one.
     pub fn log_likelihood(&self) -> f64 {
         self.raw.log_likelihood(self.evaluator.sample_size)
     }
 
+    /// Returns the difference between the [Akaike Information Criterion][] (AIC) for this model
+    /// compared with the independence model. It's desirable to have a lower AIC, but because this
+    /// is a difference, higher values are better.
+    ///
+    /// [Akaike Information Criterion]: https://en.wikipedia.org/wiki/Akaike_information_criterion
+    ///
+    /// Models from [`Model::less_complex`] may have either higher or lower AIC than this one.
     pub fn akaike_information_criterion(&self) -> f64 {
         let ModelEvaluator {
             sample_size,
@@ -984,6 +1224,13 @@ impl<V: VariableId> ModelEvaluation<'_, V> {
             - self.raw.akaike_information_criterion(*sample_size)
     }
 
+    /// Returns the difference between the [Bayesian Information Criterion][] (BIC) for this model
+    /// compared with the independence model. It's desirable to have a lower BIC, but because this
+    /// is a difference, higher values are better.
+    ///
+    /// [Bayesian Information Criterion]: https://en.wikipedia.org/wiki/Bayesian_information_criterion
+    ///
+    /// Models from [`Model::less_complex`] may have either higher or lower BIC than this one.
     pub fn bayesian_information_criterion(&self) -> f64 {
         let ModelEvaluator {
             sample_size,
@@ -994,10 +1241,17 @@ impl<V: VariableId> ModelEvaluation<'_, V> {
             - self.raw.bayesian_information_criterion(*sample_size)
     }
 
+    /// Returns the probability that you'd be making a mistake if you claimed that this model has a
+    /// different distribution than the one that produced the original data. If you evaluated the
+    /// top (most complex) model, this value would be 100%, because in that case the model is
+    /// exactly identical to the data.
     pub fn top_alpha(&self) -> f64 {
         self.alpha(self.evaluator.top)
     }
 
+    /// Returns the probability that you'd be making a mistake if you claimed that this model has a
+    /// different distribution than the independence model. If you evaluated the bottom (least
+    /// complex) model, this value would be 100%, since the models are in fact the same model.
     pub fn bottom_alpha(&self) -> f64 {
         self.alpha(self.evaluator.bottom)
     }
