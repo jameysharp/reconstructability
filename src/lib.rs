@@ -240,6 +240,21 @@ impl<V: VariableId> VariableSet<V> {
     pub fn is_superset(&self, other: &Self) -> bool {
         other.is_subset(self)
     }
+
+    /// Returns an iterator over every subset of this variable set that has one less variable in
+    /// it.
+    fn remove_one_variable(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = Self> + ExactSizeIterator + iter::FusedIterator + '_ {
+        // Working from the end backward produces the subsets in lexicographic order, which reduces
+        // copying if all of these subsets are added to a model.
+        (0..self.len()).rev().map(move |remove_idx| {
+            let mut selected = VariableSet(SmallVec::with_capacity(self.len() - 1));
+            selected.0.extend_from_slice(&self.0[..remove_idx]);
+            selected.0.extend_from_slice(&self.0[remove_idx + 1..]);
+            selected
+        })
+    }
 }
 
 impl<V: VariableId + std::fmt::Debug> std::fmt::Debug for VariableSet<V> {
@@ -649,23 +664,9 @@ impl<V: VariableId> Model<V> {
             model.relations.extend_from_slice(before);
             model.relations.extend_from_slice(after);
 
-            // Now add every subset of this relation that is one variable smaller. Start by setting
-            // aside the last variable. Working from the end backward produces the subsets in
-            // lexicographic order.
-            let (withheld, reduced) = removed.0.split_last().unwrap();
-            let mut withheld = *withheld;
-            let mut reduced = SmallVec::from(reduced);
-
-            for remove_var in (0..reduced.len()).rev() {
-                model.add_relation(VariableSet(reduced.clone()));
-
-                // Put the withheld variable back and remove the variable immediately before it.
-                // The remove/insert pair doesn't shift any other variables around and this
-                // maintains VariableSet's invariant that the variables are in sorted order.
-                swap(&mut withheld, &mut reduced[remove_var]);
+            for reduced in removed.remove_one_variable() {
+                model.add_relation(reduced);
             }
-            model.add_relation(VariableSet(reduced));
-
             model
         })
     }
