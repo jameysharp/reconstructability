@@ -22,8 +22,9 @@ use smallvec::SmallVec;
 use sorted_iter::assume::AssumeSortedByItemExt;
 use sorted_iter::multiway_union;
 use statrs::distribution::{ChiSquared, Univariate};
+use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::LN_2;
 use std::iter;
 use std::mem::swap;
@@ -140,7 +141,7 @@ impl<V: VariableId> VariableSet<V> {
     /// assert!(!one.is_subset(&nil));
     /// ```
     pub fn is_subset(&self, other: &Self) -> bool {
-        self.len() <= other.len() && self.iter().intersection(other.iter()).count() == self.len()
+        self.len() <= other.len() && self.iter().intersection(other.iter()).eq(self.iter())
     }
 
     /// Returns `true` if `self` contains every variable that `other` does.
@@ -172,6 +173,13 @@ impl<V: VariableId> VariableSet<V> {
             selected.0.extend_from_slice(&self.0[remove_idx + 1..]);
             selected
         })
+    }
+
+    // Returns whether the symmetric difference of these two sets has exactly one variable from
+    // each set. Every pair of sets that [`VariableSet::remove_one_variable`] returns will return
+    // `true` from this method.
+    fn equal_except_one(&self, other: &Self) -> bool {
+        self.iter().union(other.iter()).count() == self.len() + 1
     }
 }
 
@@ -587,6 +595,116 @@ impl<V: VariableId> Model<V> {
             }
             model
         })
+    }
+
+    /// An iterator producing every model which is one step up the lattice of structures.
+    ///
+    /// See the papers cited in the crate-level documentation for an explanation of the lattice of
+    /// structures.
+    ///
+    /// Because these models only support binary variables, every model returned has exactly one
+    /// degree of freedom more than the current model.
+    ///
+    /// ```
+    /// use reconstructability::{Model, VariableSet};
+    ///
+    /// let mut abc = Model::new();
+    /// abc.add_relation(VariableSet::new(&[1, 2, 3]));
+    ///
+    /// let ab = VariableSet::new(&[1, 2]);
+    /// let ac = VariableSet::new(&[1, 3]);
+    /// let bc = VariableSet::new(&[2, 3]);
+    ///
+    /// let mut ab_ac_bc = Model::new();
+    /// ab_ac_bc.add_relation(ab.clone()).add_relation(ac.clone()).add_relation(bc.clone());
+    ///
+    /// let mut df1 = ab_ac_bc.more_complex();
+    ///
+    /// assert_eq!(df1.next(), Some(abc));
+    /// assert_eq!(df1.next(), None);
+    /// ```
+    pub fn more_complex(&self) -> impl Iterator<Item = Self> + iter::FusedIterator + '_ {
+        // XXX: This is not nearly so pretty as the implementation of less_complex. Can it be
+        // simpler?
+
+        // `less_complex` picks a relation from the model and replaces it with all relations that
+        // have one variable less. So to find a more complex model, we need to find a relation such
+        // that all its one-smaller subsets are already subsets of this model, and add that
+        // relation to this model.
+        //
+        // The biggest relation we can construct this way is one larger than the largest relation
+        // we already have. The smallest is length 2, constructed from any pair of variables.
+        //
+        // It's more convenient to work in terms of the size of relations that we're merging,
+        // though, so subtract 1 from both lengths.
+        let biggest = self.relations.first().map_or(0, |r| r.len());
+        let smallest = 1;
+
+        // Reuse allocations for working sets.
+        let mut current_subsets = HashSet::new();
+        let mut previous_subsets = HashSet::new();
+        let mut merged = VariableSet(SmallVec::with_capacity(biggest + 1));
+
+        // Work from the biggest relations to the smallest, so that we have all the length-N
+        // subsets of larger relations when we start looking at the length-N relations. Since the
+        // model's sort order is already by descending length, just iterate it.
+        let mut relations = self.relations.iter().map(Cow::Borrowed).peekable();
+        (smallest..=biggest)
+            .rev()
+            .flat_map(move |size| {
+                previous_subsets.clear();
+                swap(&mut previous_subsets, &mut current_subsets);
+
+                while Some(size) == relations.peek().map(|r| r.len()) {
+                    current_subsets.insert(relations.next().unwrap());
+                }
+
+                for subset in previous_subsets.iter() {
+                    current_subsets.extend(subset.remove_one_variable().map(Cow::Owned));
+                }
+
+                let mut seen = HashSet::new();
+
+                // We're currently trying to form a merged relation of length `size+1`. The number
+                // of one-variable-smaller subsets we have to have for that is also `size+1`. So
+                // after picking one relation there need to still be `size` relations left, and
+                // after picking a second one there need to still be `size-1`.
+                let mut rest = current_subsets.iter();
+                while let Some(a) = rest.next() {
+                    if rest.len() < size {
+                        break;
+                    }
+
+                    let mut rest = rest.clone();
+                    while let Some(b) = rest.next() {
+                        if rest.len() < size - 1 {
+                            break;
+                        }
+
+                        if !a.equal_except_one(b) {
+                            continue;
+                        }
+
+                        merged.0.clear();
+                        merged.0.extend(a.iter().union(b.iter()));
+                        debug_assert_eq!(merged.len(), size + 1);
+
+                        if seen.contains(&merged) || previous_subsets.contains(&merged) {
+                            continue;
+                        }
+                        if rest.clone().filter(|r| merged.is_superset(r)).count() == size - 1 {
+                            seen.insert(merged.clone());
+                        }
+                    }
+                }
+
+                seen
+            })
+            .map(move |relation| {
+                let mut model = self.clone();
+                model.add_relation(relation.clone());
+                model
+            })
     }
 
     /// Computes a plan for how to evaluate this model against the observed data.
