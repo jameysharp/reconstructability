@@ -241,6 +241,7 @@ dependencies = [
  "csv-core",
  "lasso",
  "smallvec",
+ "sorted-iter",
  "statrs",
 ]
 
@@ -249,6 +250,12 @@ name = "smallvec"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7acad6f34eb9e8a259d3283d1e8c1d34d7415943d4895f65cc73813c7396fc85"
+
+[[package]]
+name = "sorted-iter"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cbe9135ed5fd05813a47006636308dc34f5df43e6be5bf3f76744669248c2c8b"
 
 [[package]]
 name = "statrs"

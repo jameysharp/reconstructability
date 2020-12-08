@@ -15,8 +15,12 @@
 //! [OCCAM]: https://github.com/occam-ra/occam
 //! [OCCAM manual]: https://occam.readthedocs.io/en/latest/
 
+pub use sorted_iter::SortedIterator;
+
 use lasso::{LargeSpur, MicroSpur, MiniSpur, Spur};
 use smallvec::SmallVec;
+use sorted_iter::assume::AssumeSortedByItemExt;
+use sorted_iter::multiway_union;
 use statrs::distribution::{ChiSquared, Univariate};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -119,94 +123,8 @@ impl<V: VariableId> VariableSet<V> {
     /// assert_eq!(it.next(), Some(3));
     /// assert_eq!(it.next(), None);
     /// ```
-    pub fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = V> + ExactSizeIterator + iter::FusedIterator + '_ {
-        self.0.iter().copied()
-    }
-
-    /// Returns an iterator over the variables which appear in both sets.
-    ///
-    /// ```
-    /// use reconstructability::VariableSet;
-    ///
-    /// let abc = VariableSet::new(&[2, 3, 1]);
-    /// let ab = VariableSet::new(&[1, 2]);
-    /// let ac = VariableSet::new(&[1, 3]);
-    /// let bc = VariableSet::new(&[2, 3]);
-    ///
-    /// assert_eq!(abc.intersection(&ab).collect::<Vec<_>>(), vec![1, 2]);
-    /// assert_eq!(ab.intersection(&abc).collect::<Vec<_>>(), vec![1, 2]);
-    /// assert_eq!(abc.intersection(&ac).collect::<Vec<_>>(), vec![1, 3]);
-    /// assert_eq!(ac.intersection(&abc).collect::<Vec<_>>(), vec![1, 3]);
-    /// assert_eq!(abc.intersection(&bc).collect::<Vec<_>>(), vec![2, 3]);
-    /// assert_eq!(bc.intersection(&abc).collect::<Vec<_>>(), vec![2, 3]);
-    /// assert_eq!(ab.intersection(&ac).collect::<Vec<_>>(), vec![1]);
-    /// assert_eq!(ac.intersection(&ab).collect::<Vec<_>>(), vec![1]);
-    /// assert_eq!(ab.intersection(&bc).collect::<Vec<_>>(), vec![2]);
-    /// assert_eq!(bc.intersection(&ab).collect::<Vec<_>>(), vec![2]);
-    /// assert_eq!(ac.intersection(&bc).collect::<Vec<_>>(), vec![3]);
-    /// assert_eq!(bc.intersection(&ac).collect::<Vec<_>>(), vec![3]);
-    /// ```
-    pub fn intersection<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = V> + 'a {
-        let mut ys = other.0.iter().copied();
-        let mut maybe_y = ys.next();
-        self.0.iter().copied().filter(move |x| {
-            while let Some(y) = maybe_y {
-                if y > *x {
-                    break;
-                }
-                maybe_y = ys.next();
-                if y == *x {
-                    return true;
-                }
-            }
-            false
-        })
-    }
-
-    /// Returns an iterator over the variables which appear in either set.
-    ///
-    /// ```
-    /// use reconstructability::VariableSet;
-    ///
-    /// let all = vec![1, 2, 3];
-    ///
-    /// let abc = VariableSet::new(&[2, 3, 1]);
-    /// let ab = VariableSet::new(&[1, 2]);
-    /// let ac = VariableSet::new(&[1, 3]);
-    /// let bc = VariableSet::new(&[2, 3]);
-    /// let a = VariableSet::new(&[1]);
-    /// let b = VariableSet::new(&[2]);
-    /// let c = VariableSet::new(&[3]);
-    ///
-    /// let subsets = [
-    ///     (&abc, &ab), (&abc, &ac), (&abc, &bc),
-    ///     (&ab, &ac), (&ab, &bc), (&ac, &bc),
-    ///     (&a, &bc), (&b, &ac), (&c, &ab),
-    /// ];
-    ///
-    /// for (x, y) in &subsets {
-    ///     assert_eq!(&x.union(y).collect::<Vec<_>>(), &all);
-    ///     assert_eq!(&y.union(x).collect::<Vec<_>>(), &all);
-    /// }
-    /// ```
-    pub fn union<'a>(&'a self, other: &'a Self) -> impl Iterator<Item = V> + 'a {
-        let mut xs = self.0.iter().copied().peekable();
-        let mut ys = other.0.iter().copied().peekable();
-        iter::from_fn(move || match (xs.peek().copied(), ys.peek().copied()) {
-            (None, None) => None,
-            (Some(_), None) => xs.next(),
-            (None, Some(_)) => ys.next(),
-            (Some(x), Some(y)) => match x.cmp(&y) {
-                Ordering::Less => xs.next(),
-                Ordering::Greater => ys.next(),
-                Ordering::Equal => {
-                    ys.next();
-                    xs.next()
-                }
-            },
-        })
+    pub fn iter(&self) -> impl SortedIterator<Item = V> + '_ {
+        self.0.iter().copied().assume_sorted_by_item()
     }
 
     /// Returns `true` if `other` contains every variable that `self` does.
@@ -222,7 +140,7 @@ impl<V: VariableId> VariableSet<V> {
     /// assert!(!one.is_subset(&nil));
     /// ```
     pub fn is_subset(&self, other: &Self) -> bool {
-        self.len() <= other.len() && self.intersection(other).count() == self.len()
+        self.len() <= other.len() && self.iter().intersection(other.iter()).count() == self.len()
     }
 
     /// Returns `true` if `self` contains every variable that `other` does.
@@ -413,7 +331,7 @@ impl<V: VariableId> Table<V> {
         // Reuse the same heap allocation for every projection to avoid hammering the allocator.
         let mut projected_state = Vec::with_capacity(on.len());
         for (state, count) in self.raw_data.iter() {
-            projected_state.extend(state.intersection(on));
+            projected_state.extend(state.iter().intersection(on.iter()));
             projection.add_cell(VariableSet::new(&projected_state), *count);
             projected_state.clear();
         }
@@ -453,7 +371,7 @@ impl<V: VariableId> Table<V> {
         for (state_a, count_a) in self.raw_data.iter() {
             sample_size += count_a;
             for (state_b, count_b) in other.raw_data.iter() {
-                composed_state.extend(state_a.union(state_b));
+                composed_state.extend(state_a.iter().union(state_b.iter()));
                 composition.add_cell(VariableSet::new(&composed_state), count_a * count_b);
                 composed_state.clear();
             }
@@ -826,7 +744,7 @@ impl<V: VariableId> QueryPlan<V> {
             while let Some(a) = relations.next() {
                 total += (a.0.len() as f64).exp2() - 1.0;
                 for b in relations.clone() {
-                    total -= (a.intersection(b).count() as f64).exp2() - 1.0;
+                    total -= (a.iter().intersection(b.iter()).count() as f64).exp2() - 1.0;
                 }
             }
         }
@@ -922,13 +840,19 @@ fn iterative_proportional_fit<V: VariableId>(
         state: VariableSet<V>,
     ) {
         if let Some(((relation, margin), rest)) = margins.split_first() {
-            let common: VariableSet<V> = seen.intersection(relation).collect();
-            let seen: VariableSet<V> = seen.union(relation).collect();
+            let common: VariableSet<V> = seen.iter().intersection(relation.iter()).collect();
+            let common_state: VariableSet<V> = common.iter().intersection(state.iter()).collect();
+            let seen: VariableSet<V> = seen.iter().union(relation.iter()).collect();
 
             for current in margin.raw_data.keys() {
-                if common.intersection(current).eq(common.intersection(&state)) {
+                if common
+                    .iter()
+                    .intersection(current.iter())
+                    .eq(common_state.iter())
+                {
                     keys.push(current);
-                    init(result, keys, rest, &seen, state.union(current).collect());
+                    let new_state = state.iter().union(current.iter());
+                    init(result, keys, rest, &seen, new_state.collect());
                     keys.pop();
                 }
             }
@@ -988,10 +912,8 @@ fn iterative_proportional_fit<V: VariableId>(
     let raw_data: HashMap<_, _> = result
         .into_iter()
         .map(|(keys, count)| {
-            let mut state = VariableSet::new(&[]);
-            for key in keys {
-                state = state.union(key).collect();
-            }
+            let state: VariableSet<_> =
+                multiway_union(keys.into_iter().map(|key| key.iter())).collect();
             (state, count)
         })
         .collect();
