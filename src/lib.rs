@@ -1,4 +1,6 @@
 #![warn(missing_docs)]
+#![doc(test(no_crate_inject))]
+#![doc(test(attr(deny(unused, future_incompatible))))]
 
 //! This crate provides an implementation of Reconstructability Analysis, as described by these
 //! papers:
@@ -559,9 +561,6 @@ impl<V: VariableId> Model<V> {
     /// let ab = VariableSet::new(&[1, 2]);
     /// let ac = VariableSet::new(&[1, 3]);
     /// let bc = VariableSet::new(&[2, 3]);
-    /// let a = VariableSet::new(&[1]);
-    /// let b = VariableSet::new(&[2]);
-    /// let c = VariableSet::new(&[3]);
     ///
     /// let mut df1 = abc.less_complex();
     /// let mut ab_ac_bc = Model::new();
