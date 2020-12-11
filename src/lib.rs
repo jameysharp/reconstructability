@@ -1288,6 +1288,15 @@ impl<V: VariableId> ModelEvaluation<'_, V> {
         self.raw.log_likelihood(self.evaluator.sample_size)
     }
 
+    /// Returns the natural logarithm of the ratio of this model's likelihood compared to the
+    /// independence model.
+    pub fn delta_log_likelihood(&self) -> f64 {
+        self.evaluator
+            .bottom
+            .log_likelihood(self.evaluator.sample_size)
+            - self.log_likelihood()
+    }
+
     /// Returns the difference between the [Akaike Information Criterion][] (AIC) for this model
     /// compared with the independence model. It's desirable to have a lower AIC, but because this
     /// is a difference, higher values are better.

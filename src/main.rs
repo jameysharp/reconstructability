@@ -107,6 +107,10 @@ fn main() -> io::Result<()> {
 
         let evaluation = evaluator.evaluate(&model);
         println!("  dDF: {}", evaluation.delta_degrees_of_freedom());
+        println!(
+            "  log of likelihood ratio: {:.5}",
+            evaluation.delta_log_likelihood()
+        );
         println!("  uncertainty: {:.5} bits", evaluation.uncertainty());
         println!("  transmission: {:.5} bits", evaluation.transmission());
         println!("  information: {:.2}%", evaluation.information() * 100.0);
