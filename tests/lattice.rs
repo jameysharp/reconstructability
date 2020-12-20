@@ -11,14 +11,21 @@ fn reversible_lattice() {
 
     while !current_layer.is_empty() {
         for (model, parents) in current_layer.drain(..) {
-            let computed = model.more_complex().collect::<HashSet<_>>();
+            let mut computed = HashSet::new();
+            for parent in model.more_complex() {
+                let unique = computed.insert(parent);
+                // more_complex must not produce duplicates
+                assert!(unique);
+            }
             assert_eq!(computed, parents);
 
             for next in model.less_complex() {
-                next_layer
+                let unique = next_layer
                     .entry(next)
                     .or_insert_with(HashSet::new)
                     .insert(model.clone());
+                // less_complex must not produce duplicates
+                assert!(unique);
             }
         }
 
