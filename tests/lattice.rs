@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 #[test]
 fn reversible_lattice() {
     let mut saturated = Model::new();
-    saturated.add_relation((0u8..4).into_iter().collect());
+    saturated.add_relation((0u8..5).into_iter().collect());
 
     let mut current_layer = vec![(saturated, HashSet::new())];
     let mut next_layer = HashMap::new();
