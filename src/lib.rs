@@ -814,38 +814,51 @@ impl<V: VariableId> Model<V> {
         let mut min_size = 2;
         iter::from_fn(move || {
             if candidates.candidates.is_empty() {
+                // There's nothing to extend and nothing to report, so we're done.
                 return None;
             }
 
             if let Some(earliest) = candidates.earliest {
-                // We can prove some of the pairs are unreachable from the current candidates,
-                // either because this pair's key is smaller than the smallest variable we might
-                // use as a lookup key, or because the current candidates can't be a subset of this
-                // pair's common variables because all the candidates are bigger.
+                // We can prove some of the pairs are unreachable from the current candidates...
                 pairs.retain(|(a, _), commons| {
                     if *a < earliest {
+                        // ...either because this pair's key is smaller than the smallest variable
+                        // we might use as a lookup key...
                         false
                     } else {
-                        // Note that removing a relation can't break Model's invariant that no
-                        // relation is a subset of any other.
-                        commons.relations.retain(|common| common.len() >= min_size);
+                        // ...or because the current candidates can't be a subset of this pair's
+                        // common variables because all the candidates are bigger. Since the
+                        // relations in a Model are kept sorted by descending size, we just have to
+                        // find the last relation that is big enough to keep using. Note that
+                        // removing a relation can't break Model's invariant that no relation is a
+                        // subset of any other.
+                        commons.relations.truncate(
+                            commons
+                                .iter()
+                                .take_while(|common| common.len() >= min_size)
+                                .count(),
+                        );
                         !commons.relations.is_empty()
                     }
                 });
-
-                // The smaller this HashMap is, the more likely it is to fit in cache. So if the
-                // above pruning removed enough entries that the table can fit in fewer hash
-                // buckets, then it's worth reallocating it. Also, this seems to be the only way to
-                // rehash away any deleted entries, which could otherwise lead to more hash probes
-                // than expected.
-                pairs.shrink_to_fit();
             } else {
                 // If, the last time we constructed a set of candidates, there were no common sets
-                // to get a minimum variable from, then this must be the last group of candidates:
-                // the commons.iter() loop below won't run for any candidate and so it won't add
-                // anything to next. Short-circuit the outer loop and just return what we have now.
+                // to get a minimum variable from, then no pair is reachable: the commons.iter()
+                // loop below won't run for any candidate and so pairs.get() will never be called.
+                pairs.clear();
+            }
+
+            if pairs.is_empty() {
+                // If pairs.get() would always return None then the below loop is a no-op.
+                // Short-circuit the outer loop and just return what we have now.
                 return Some(replace(&mut candidates, Candidates::new()).candidates);
             }
+
+            // The smaller this HashMap is, the more likely it is to fit in cache. So if the above
+            // pruning removed enough entries that the table can fit in fewer hash buckets, then
+            // it's worth reallocating it. Also, this seems to be the only way to rehash away any
+            // deleted entries, which could otherwise lead to more hash probes than expected.
+            pairs.shrink_to_fit();
 
             // Now just smash together every combination of an existing candidate and a pair of
             // variables from any of its common sets.
