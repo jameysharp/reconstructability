@@ -812,6 +812,7 @@ impl<V: VariableId> Model<V> {
         // them with.
 
         let mut min_size = 2;
+        let mut temp_model = None;
         iter::from_fn(move || {
             if candidates.candidates.is_empty() {
                 // There's nothing to extend and nothing to report, so we're done.
@@ -909,11 +910,17 @@ impl<V: VariableId> Model<V> {
             // they'll also generate candidates which are already subsets of existing relations. In
             // that case, adding the relation will leave the model unchanged, so the result is
             // obviously not more complex than the original.
-            let mut model = self.clone();
+            //
+            // The easy way to check this condition is to clone self, try adding the relation, and
+            // see if the clone didn't change. If it didn't change, though, we can save the clone
+            // and use it again for the next relation. That way there is always at most one
+            // unnecessary clone allocated.
+            let mut model = temp_model.take().unwrap_or_else(|| self.clone());
             model.add_relation(relation);
             if &model != self {
                 Some(model)
             } else {
+                temp_model = Some(model);
                 None
             }
         })
