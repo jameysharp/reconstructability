@@ -21,15 +21,15 @@ pub use sorted_iter;
 
 use lasso::{LargeSpur, MicroSpur, MiniSpur, Spur};
 use smallvec::SmallVec;
-use sorted_iter::assume::{AssumeSortedByItemExt, AssumeSortedByKeyExt};
+use sorted_iter::assume::AssumeSortedByItemExt;
 use sorted_iter::sorted_iterator::SortedByItem;
 use sorted_iter::{multiway_union, SortedIterator, SortedPairIterator};
 use statrs::distribution::{ChiSquared, Univariate};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::f64::consts::LN_2;
 use std::iter;
-use std::mem::swap;
+use std::mem::{replace, swap};
 
 /// Types which can be used in a [`VariableSet`].
 pub trait VariableId: Sized + Copy + std::hash::Hash + Ord {
@@ -126,7 +126,7 @@ impl<V: VariableId> VariableSet<V> {
     /// assert_eq!(it.next(), Some(3));
     /// assert_eq!(it.next(), None);
     /// ```
-    pub fn iter(&self) -> impl Iterator<Item = V> + SortedByItem + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = V> + SortedByItem + Clone + '_ {
         self.0.iter().copied().assume_sorted_by_item()
     }
 
@@ -615,7 +615,7 @@ impl<V: VariableId> Model<V> {
     /// assert_eq!(df1.next(), Some(abc));
     /// assert_eq!(df1.next(), None);
     /// ```
-    pub fn more_complex(&self) -> impl Iterator<Item = Self> + iter::FusedIterator + '_ {
+    pub fn more_complex(&self) -> impl Iterator<Item = Self> + '_ {
         // `less_complex` picks a relation from the model and replaces it with all relations that
         // have one variable less. So to find a more complex model, we need to find a relation such
         // that:
@@ -633,197 +633,260 @@ impl<V: VariableId> Model<V> {
         // form of condition #2: the result is not a subset of any of the selected relations, but
         // may be a subset of some other relation in the model.
         //
-        // Since a variable can only occur once in a relation, it can't occur more than N times in
-        // N relations. And if a variable occurs less than N-1 times in N relations, then it not
-        // only isn't part of a candidate for this size, but adding more relations can't make it
-        // part of a candidate either.
+        // So the general strategy here is to pick various subsets of the relations, and keep track
+        // of those variables which are common across every one of the currently-selected
+        // relations, or are missing in exactly one of the relations. Then we can combine these
+        // subsets: given groups A and B, any variable which occurs exactly once in A and
+        // everywhere in B occurs exactly once in the combined group.
         //
-        // So we keep track of those variables which have occurred either in every one of the
-        // currently-selected N relations, or in all but one of the relations. For the latter, we
-        // also keep track of which relation each variable is missing from.
+        // The question then is how to select initial groups such that combinations of them can
+        // cover every subset. I've chosen to take every subset of the model that has either 2 or 3
+        // relations. Then combining those groups with the 2-relation groups gives the 4- and
+        // 5-relation groups; repeatedly combining with the 2-relation groups eventually visits all
+        // subsets of the original model. Once a collection of larger groups has been generated,
+        // the smaller groups are no longer needed and can be dropped to save memory.
+        //
+        // To ensure that each subset is visited only once, we rely on the total ordering of
+        // variables (V: Ord). A subset which includes variables up through K will only be extended
+        // using subsets that contain variables strictly larger than K. This suggests another
+        // opportunity to drop data that is never going to be used again.
+        //
+        // It often happens that several different combinations of relations suggest the same
+        // more-complex relation. This algorithm allows eliminating duplicates at every step, so it
+        // produces each result exactly once and does less work than a more obvious implementation.
 
-        struct State<I, V: VariableId> {
-            relations: I,
-            missing_none: VariableSet<V>,
-            missing_one: Vec<(V, usize)>,
+        fn combinations<V, I>(mut iter: I) -> impl Iterator<Item = (V, I)>
+        where
+            I: Iterator<Item = V> + Clone,
+        {
+            iter::from_fn(move || Some((iter.next()?, iter.clone())))
         }
-        let mut stack = Vec::new();
-        stack.push(State {
-            relations: self.relations.iter(),
-            missing_none: VariableSet::new(&[]),
-            missing_one: Vec::new(),
-        });
 
-        let mut candidates = HashSet::new();
+        #[derive(Debug)]
+        struct Candidates<V: VariableId> {
+            candidates: HashMap<VariableSet<V>, Model<V>>,
+            earliest: Option<V>,
+        }
 
-        while let Some((cur, prev)) = stack.split_last_mut() {
-            if let Some(relation) = cur.relations.next() {
-                // For a variable to be in one of the two sets after adding the Nth relation,
-                // it must have appeared in at least N-2 of the previous N-1 relations. But
-                // that means that the first and second relations are special because they
-                // require -1 or 0 prior occurrences, respectively, which is true for all
-                // variables.
-
-                let relation_idx = prev.len();
-                if relation_idx == 0 {
-                    // We're adding the first relation to the selection, so by definition, the
-                    // variables in this relation have appeared in every relation so far and we
-                    // haven't seen any variables that are missing from any relation so far.
-                    let relations = cur.relations.clone();
-                    stack.push(State {
-                        relations,
-                        missing_none: relation.clone(),
-                        missing_one: Vec::new(),
-                    });
-                } else if relation_idx == 1 {
-                    // We're adding the second relation to the selection. The variables from the
-                    // first relation are in missing_none. Any variable that's also in this
-                    // relation stays in missing_none; otherwise annotate it by whether it was
-                    // missing in relation 0 or relation 1.
-                    let mut missing_none = VariableSet::new(&[]);
-                    let mut missing_one = Vec::new();
-                    let old = cur.missing_none.iter().pairs();
-                    let new = relation.iter().pairs();
-                    for (v, (old, new)) in old.outer_join(new) {
-                        match (old.is_some(), new.is_some()) {
-                            (true, true) => missing_none.0.push(v),
-                            (true, false) => missing_one.push((v, 1)),
-                            (false, true) => missing_one.push((v, 0)),
-                            (false, false) => unreachable!(),
-                        }
-                    }
-                    debug_assert!(missing_one.iter().any(|(_, idx)| *idx == 0));
-                    debug_assert!(missing_one.iter().any(|(_, idx)| *idx == 1));
-
-                    let relations = cur.relations.clone();
-                    stack.push(State {
-                        relations,
-                        missing_none,
-                        missing_one,
-                    });
-                } else {
-                    // Every subsequent relation we add lands here.
-                    let mut missing_none = VariableSet::new(&[]);
-                    let mut missing_one = Vec::new();
-
-                    // As a minor optimization, don't heap-allocate this vector unless we have more
-                    // relations than the number of bits SmallVec can store inline for free.
-                    let mut supported_relations = SmallVec::<[usize; 2]>::new();
-                    const BITS: usize = std::mem::size_of::<usize>() * 8;
-                    let relation_count = relation_idx + 1;
-                    supported_relations.resize((relation_count + BITS - 1) / BITS, 0);
-                    if relation_count % BITS != 0 {
-                        // Set the bits that don't correspond to any relation so later we can
-                        // simply check whether all bits are set.
-                        *supported_relations.last_mut().unwrap() = !0 << (relation_count % BITS);
-                    }
-
-                    let none = cur.missing_none.iter().pairs();
-                    let one = cur.missing_one.iter().copied().assume_sorted_by_key();
-                    let new = relation.iter().pairs();
-                    for (v, ((none, one), new)) in none.outer_join(one).left_join(new) {
-                        // outer_join ensures that at least one argument is Some, and we have
-                        // an invariant that a variable is never in both sets, so we should
-                        // have exactly one Some argument.
-                        debug_assert_ne!(none.is_some(), one.is_some());
-
-                        let missing_from = match (new, one) {
-                            // Any variable present in the current relation stays in whichever
-                            // set it was previously in.
-                            (Some(_), None) => {
-                                missing_none.0.push(v);
-                                continue;
-                            }
-                            (Some(_), Some(idx)) => idx,
-
-                            // Any variable missing from the relation either gets moved from
-                            // missing_none to missing_one, or gets removed from missing_one.
-                            (None, None) => relation_idx,
-                            (None, Some(_)) => continue,
-                        };
-                        missing_one.push((v, missing_from));
-                        supported_relations[missing_from / BITS] |= 1 << (missing_from % BITS);
-                    }
-
-                    // Every relation in the selected set must be missing at least one of the
-                    // selected variables. Otherwise, the selected variables are a subset of some
-                    // relation, so adding a new relation with those variables won't yield a more
-                    // complex model. Adding more relations to the selection can only shrink the
-                    // set of selected variables, so any extension of this state would also be a
-                    // subset of some relation.
-                    //
-                    // Because a relation can't be equal to another relation in the same model,
-                    // this condition is always satisfied for N <= 2, which is why the previous two
-                    // cases unconditionally push a new state.
-                    if supported_relations.into_iter().all(|w| w == !0) {
-                        let relations = cur.relations.clone();
-                        stack.push(State {
-                            relations,
-                            missing_none,
-                            missing_one,
-                        });
-                    }
+        impl<V: VariableId> Candidates<V> {
+            fn new() -> Self {
+                Candidates {
+                    candidates: HashMap::new(),
+                    earliest: None,
                 }
-            } else {
-                // At this point we've checked all the extensions of this state that we're
-                // going to and we just have to check this state itself. Most fields of State
-                // are only useful when extending the subset of relations, so drop them now.
-                let State {
-                    mut missing_one, ..
-                } = stack.pop().unwrap();
+            }
 
-                if missing_one.is_empty() {
-                    // This can only happen when we have fewer than two relations selected. The
-                    // code below would give the correct result (no candidates generated) but we
-                    // can short-circuit some allocations.
-                    continue;
-                }
+            fn add(&mut self, key: VariableSet<V>, common: VariableSet<V>) {
+                // No matter what, insert an entry into the map to indicate that this key is a
+                // valid result.
+                let candidate = self.candidates.entry(key).or_insert_with(Model::new);
 
-                // Regroup the selected variables according to which relation they appeared in.
-                missing_one.sort_unstable_by_key(|(v, idx)| (*idx, *v));
-
-                // Every selected relation must be missing at least one variable, but some
-                // relations might be missing multiple variables. Generate every subset of the
-                // variables such that each relation lacks exactly one.
-                let mut candidate = VariableSet(SmallVec::with_capacity(stack.len()));
-                let mut iters = Vec::with_capacity(stack.len());
-                iters.push(missing_one.into_iter());
-                while let Some(iter) = iters.last_mut() {
-                    if let Some((v, idx)) = iter.next() {
-                        match idx.cmp(&candidate.len()) {
-                            Ordering::Equal => {
-                                candidate.0.push(v);
-                                let iter = iter.clone();
-                                iters.push(iter);
-                                continue;
-                            }
-                            Ordering::Less => {
-                                // The previous variable came from a relation that had multiple
-                                // possibilities, so we're skipping past the other choices now.
-                                debug_assert_eq!(idx + 1, candidate.len());
-                                continue;
-                            }
-                            Ordering::Greater => {
-                                // Stop trying variations for this relation once we've exhausted
-                                // all its choices and fallen into the next relation. This is like
-                                // reaching the overall end of the missing_one list, except at this
-                                // point we haven't added variables from all the relations yet, so
-                                // this isn't a complete candidate.
-                            }
-                        }
-                    } else if candidate.len() >= stack.len() {
-                        debug_assert_eq!(candidate.len(), stack.len());
-                        let mut tmp = candidate.clone();
-                        tmp.0.sort_unstable();
-                        candidates.insert(tmp);
+                // But also, if there are enough variables in common such that combining this entry
+                // with a new pair might yield something, record those variables with this entry.
+                if common.len() >= 2 {
+                    // Across all the entries, the variable from the common sets which comes first
+                    // in the total order is the smallest variable which might get looked up in the
+                    // pairs map. Later we prune the pairs map accordingly.
+                    if self.earliest.is_none() || self.earliest > Some(common.0[0]) {
+                        self.earliest = Some(common.0[0]);
                     }
-                    candidate.0.pop();
-                    iters.pop();
+
+                    // These aren't proper models, but they should be a set of variable-sets where
+                    // nothing is a subset of anything else, which is what Model does. If there are
+                    // two different combinations of relations which support the current key and
+                    // have the same common set, then we only need to evaluate that combination
+                    // once. If one is a subset of the other, then any result that would satisfy
+                    // the subset will also satisfy the superset, so removing the subset doesn't
+                    // remove any correct answers.
+                    candidate.add_relation(common);
                 }
             }
         }
 
-        candidates.into_iter().filter_map(move |relation| {
+        let mut pairs =
+            HashMap::with_capacity(self.relations.len() * (self.relations.len() - 1) / 2);
+        let mut candidates = Candidates::new();
+
+        for (a, relations) in combinations(self.relations.iter()) {
+            for (b, relations) in combinations(relations) {
+                // Decide which category to put each variable in according to whether the variable
+                // appears in relation a, relation b, or both. Note that outer_join can't produce a
+                // variable which didn't appear in either set.
+                let mut common = VariableSet::new(&[]);
+                let mut missing_a = VariableSet::new(&[]);
+                let mut missing_b = VariableSet::new(&[]);
+                let a = a.iter().pairs();
+                let b = b.iter().pairs();
+                for (v, (a, b)) in a.outer_join(b) {
+                    let category = match (a.is_some(), b.is_some()) {
+                        (true, true) => &mut common,
+                        (true, false) => &mut missing_b,
+                        (false, b_is_some) => {
+                            debug_assert!(b_is_some);
+                            &mut missing_a
+                        }
+                    };
+                    category.0.push(v);
+                }
+
+                // If there are no variables missing in relation a, then every variable in b is
+                // also in a. In other words, b is a subset of a. Since no relation can be a subset
+                // of any other by the invariants of Model, this can't happen.
+                debug_assert_ne!(missing_a.len(), 0);
+                debug_assert_ne!(missing_b.len(), 0);
+
+                // Every combination of variables where one is chosen from missing_a and the other
+                // from missing_b is a valid two-variable candidate. If this pair of relations also
+                // has at least two variables in common, then later we can check if those variables
+                // match any variables missing once from another pair of relations.
+                for a in missing_a.iter() {
+                    for b in missing_b.iter() {
+                        let key = VariableSet::new(&[a, b]);
+
+                        // VariableSet::new sorts the variables, so this makes a<b and ensures that
+                        // we can find this entry in the pairs map later regardless of what order
+                        // we encounter variables in.
+                        let a = key.0[0];
+                        let b = key.0[1];
+                        if common.len() >= 2 {
+                            pairs
+                                .entry((a, b))
+                                .or_insert_with(Model::new)
+                                .add_relation(common.clone());
+                        }
+
+                        candidates.add(key, common.iter().skip_while(|v| *v <= b).collect());
+                    }
+                }
+
+                // We also need three-relation subsets, so take the two we're already looking at
+                // and combine with each possible third choice.
+                for c in relations {
+                    // (A-B)&C is the same as (A&C)-B or (A & !B & C)
+                    let missing_a: VariableSet<_> =
+                        missing_a.iter().intersection(c.iter()).collect();
+                    let missing_b: VariableSet<_> =
+                        missing_b.iter().intersection(c.iter()).collect();
+                    let missing_c: VariableSet<_> = common.iter().difference(c.iter()).collect();
+                    let common: VariableSet<_> = common.iter().intersection(c.iter()).collect();
+
+                    // Unlike the two-relation case, in a model like A:B:C all variables are
+                    // missing from two or more relations, so none of them are eligible to be the
+                    // variable selected as missing exactly once. A model like AD:BC:CD is missing
+                    // C and D from the first two relations, but there are no variables present in
+                    // both of them for the third relation to be missing. The inner loop below
+                    // won't execute in such a case but the outer loops will waste time re-checking
+                    // for each of their combinations, so just short-circuit that early.
+                    if missing_a.len() == 0 || missing_b.len() == 0 || missing_c.len() == 0 {
+                        continue;
+                    }
+
+                    // Every combination of three variables which are each missing in exactly one
+                    // of the current three relations is a valid candidate. There's no "triples"
+                    // collection to correspond to the above "pairs" collection because we can
+                    // generate all lengths just by adding a pair of variables each time.
+                    for a in missing_a.iter() {
+                        for b in missing_b.iter() {
+                            for c in missing_c.iter() {
+                                let key = VariableSet::new(&[a, b, c]);
+                                let c = key.0[2];
+                                candidates
+                                    .add(key, common.iter().skip_while(|v| *v <= c).collect());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now we have our initial candidates and the variable-pairs we're going to try to grow
+        // them with.
+
+        let mut min_size = 2;
+        iter::from_fn(move || {
+            if candidates.candidates.is_empty() {
+                return None;
+            }
+
+            if let Some(earliest) = candidates.earliest {
+                // We can prove some of the pairs are unreachable from the current candidates,
+                // either because this pair's key is smaller than the smallest variable we might
+                // use as a lookup key, or because the current candidates can't be a subset of this
+                // pair's common variables because all the candidates are bigger.
+                pairs.retain(|(a, _), commons| {
+                    if *a < earliest {
+                        false
+                    } else {
+                        // Note that removing a relation can't break Model's invariant that no
+                        // relation is a subset of any other.
+                        commons.relations.retain(|common| common.len() >= min_size);
+                        !commons.relations.is_empty()
+                    }
+                });
+
+                // The smaller this HashMap is, the more likely it is to fit in cache. So if the
+                // above pruning removed enough entries that the table can fit in fewer hash
+                // buckets, then it's worth reallocating it. Also, this seems to be the only way to
+                // rehash away any deleted entries, which could otherwise lead to more hash probes
+                // than expected.
+                pairs.shrink_to_fit();
+            } else {
+                // If, the last time we constructed a set of candidates, there were no common sets
+                // to get a minimum variable from, then this must be the last group of candidates:
+                // the commons.iter() loop below won't run for any candidate and so it won't add
+                // anything to next. Short-circuit the outer loop and just return what we have now.
+                return Some(replace(&mut candidates, Candidates::new()).candidates);
+            }
+
+            // Now just smash together every combination of an existing candidate and a pair of
+            // variables from any of its common sets.
+            let mut next = Candidates::new();
+            for (key, commons) in candidates.candidates.iter() {
+                // Each set of candidates contains both odd- and even-length keys, of length either
+                // min_size or min_size+1.
+                debug_assert_eq!(key.len() & !1, min_size);
+
+                // This key may represent candidates from multiple different subsets of the
+                // relations. Although they're all the same in the sense that they're missing
+                // exactly one variable each from key, the other variables that they share may
+                // vary.
+                for common in commons.iter() {
+                    for (a, variables) in combinations(common.iter()) {
+                        debug_assert!(*key.0.last().unwrap() < a);
+                        for (b, variables) in combinations(variables) {
+                            debug_assert!(a < b);
+                            if let Some(pair) = pairs.get(&(a, b)) {
+                                for other in pair.iter() {
+                                    // key+{a,b} is only a valid candidate if at least one of the
+                                    // common sets for the pair {a,b} has key as a subset: key
+                                    // represents our current choice of missing-exactly-once
+                                    // variables, so we can only add more if the target pair of
+                                    // relations is not missing any of those variables.
+                                    if key.is_subset(other) {
+                                        let mut new_key = key.clone();
+                                        new_key.0.push(a);
+                                        new_key.0.push(b);
+                                        next.add(
+                                            new_key,
+                                            variables.clone().intersection(other.iter()).collect(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            min_size += 2;
+            Some(replace(&mut candidates, next).candidates)
+        })
+        .flatten()
+        .filter_map(move |(relation, _)| {
+            // The above iterators guarantee to generate each candidate relation exactly once, but
+            // they'll also generate candidates which are already subsets of existing relations. In
+            // that case, adding the relation will leave the model unchanged, so the result is
+            // obviously not more complex than the original.
             let mut model = self.clone();
             model.add_relation(relation);
             if &model != self {
