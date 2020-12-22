@@ -715,9 +715,9 @@ impl<V: VariableId> Model<V> {
                 let mut common = VariableSet::new(&[]);
                 let mut missing_a = VariableSet::new(&[]);
                 let mut missing_b = VariableSet::new(&[]);
-                let a = a.iter().pairs();
-                let b = b.iter().pairs();
-                for (v, (a, b)) in a.outer_join(b) {
+                let a_iter = a.iter().pairs();
+                let b_iter = b.iter().pairs();
+                for (v, (a, b)) in a_iter.outer_join(b_iter) {
                     let category = match (a.is_some(), b.is_some()) {
                         (true, true) => &mut common,
                         (true, false) => &mut missing_b,
@@ -762,13 +762,22 @@ impl<V: VariableId> Model<V> {
                 // We also need three-relation subsets, so take the two we're already looking at
                 // and combine with each possible third choice.
                 for c in relations {
-                    // (A-B)&C is the same as (A&C)-B or (A & !B & C)
-                    let missing_a: VariableSet<_> =
-                        missing_a.iter().intersection(c.iter()).collect();
-                    let missing_b: VariableSet<_> =
-                        missing_b.iter().intersection(c.iter()).collect();
-                    let missing_c: VariableSet<_> = common.iter().difference(c.iter()).collect();
-                    let common: VariableSet<_> = common.iter().intersection(c.iter()).collect();
+                    let mut missing_a = VariableSet::new(&[]);
+                    let mut missing_b = VariableSet::new(&[]);
+                    let mut missing_c = VariableSet::new(&[]);
+                    let mut common = VariableSet::new(&[]);
+                    let a_iter = a.iter().pairs();
+                    let b_iter = b.iter().pairs();
+                    let c_iter = c.iter().pairs();
+                    for (v, ((a, b), c)) in a_iter.outer_join(b_iter).left_join(c_iter) {
+                        match (a.is_some(), b.is_some(), c.is_some()) {
+                            (false, true, true) => missing_a.0.push(v),
+                            (true, false, true) => missing_b.0.push(v),
+                            (true, true, false) => missing_c.0.push(v),
+                            (true, true, true) => common.0.push(v),
+                            _ => {}
+                        }
+                    }
 
                     // Unlike the two-relation case, in a model like A:B:C all variables are
                     // missing from two or more relations, so none of them are eligible to be the
