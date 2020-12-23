@@ -32,6 +32,9 @@ use std::iter;
 use std::mem::{replace, swap};
 
 /// Types which can be used in a [`VariableSet`].
+///
+/// Such types need to implement all of the following traits, typically by `#[derive()]`ing them:
+/// `Clone`, `Copy`, `Debug`, `Eq`, `Hash`, `Ord`, `PartialEq`, `PartialOrd`
 pub trait VariableId: Sized + Copy + std::hash::Hash + Ord {
     /// SmallVec contains two `usize` fields which overlap with the inline vector, so variable sets
     /// will have minimum size if this array occupies the same number of bytes.
@@ -50,46 +53,42 @@ pub trait VariableId: Sized + Copy + std::hash::Hash + Ord {
 /// type to the biggest array that will fit within a [`SmallVec`][smallvec::SmallVec]'s minimum
 /// size.
 ///
-/// It also generates a test with the given `$testname` that checks that the generated definition
-/// is as small as the smallest `SmallVec`.
+/// It also generates a compile-time assertion that the generated definition is as small as the
+/// smallest possible `SmallVec`.
 ///
-/// For example, this library provides implementations for the basic unsigned integer types using
-/// this declaration:
+/// For example:
 ///
-/// ```ignore
-/// variable_id![unsigned_id_size, u8, u16, u32, u64, usize];
+/// ```
+/// #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// struct Variable8(u8);
+/// #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// struct Variable16(u16);
+///
+/// reconstructability::variable_id![Variable8, Variable16];
 /// ```
 #[macro_export]
 macro_rules! variable_id {
-    ($testname:ident, $($t:ty),*) => {
+    ($($t:ty),*) => {
         $(
             impl $crate::VariableId for $t {
                 type SmallArray = [
                     Self;
-                    2 * ::std::mem::size_of::<usize>() / ::std::mem::size_of::<Self>()
+                    2 * ::core::mem::size_of::<usize>() / ::core::mem::size_of::<Self>()
                 ];
             }
+            const _: () = {
+                let _ = ::core::mem::transmute::<
+                    $crate::VariableSet<$t>,
+                    ::smallvec::SmallVec<[(); 0]>,
+                >;
+            };
         )*
-
-        #[cfg(test)]
-        #[test]
-        fn $testname() {
-            use $crate::VariableSet;
-            use smallvec::SmallVec;
-            use std::mem::size_of;
-            $(
-                assert_eq!(
-                    size_of::<VariableSet<$t>>(),
-                    size_of::<SmallVec<[(); 0]>>()
-                );
-            )*
-        }
     };
 }
 
-variable_id![lasso_id_size, LargeSpur, Spur, MiniSpur, MicroSpur];
-variable_id![unsigned_id_size, u8, u16, u32, u64, usize];
-variable_id![signed_id_size, i8, i16, i32, i64, isize];
+variable_id![LargeSpur, Spur, MiniSpur, MicroSpur];
+variable_id![u8, u16, u32, u64, usize];
+variable_id![i8, i16, i32, i64, isize];
 
 /// A set of variables.
 ///
