@@ -419,7 +419,22 @@ impl<V: VariableId> Table<V> {
 }
 
 /// A model is a set of [`VariableSet`]s, called "relations", where no relation is a subset of any
-/// other in the same model.
+/// other in the same model. In discrete math, this is called a [Sperner family][] over the set of
+/// variables.
+///
+/// [Sperner family]: https://en.wikipedia.org/wiki/Sperner_family
+///
+/// # Complexity
+///
+/// By [Sperner's theorem][], the largest possible Sperner family over a set of N variables,
+/// meaning the largest number of relations which can appear in a single model, is `N choose
+/// floor(N/2)`. That's approximately `(2 ^ n) / sqrt(pi * n / 2)`, or `O(2^n/sqrt(n))`.
+///
+/// [Sperner's theorem]: https://en.wikipedia.org/wiki/Sperner%27s_theorem
+///
+/// This is important to consider when analyzing the asymptotic complexity of algorithms that
+/// operate on models: if an algorithm is linear in the size of the model, then in the worst case
+/// it is exponential in the number of variables.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Model<V: VariableId> {
     relations: Vec<VariableSet<V>>,
