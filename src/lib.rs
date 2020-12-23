@@ -488,6 +488,18 @@ impl<V: VariableId> Model<V> {
         b.len().cmp(&a.len()).then_with(|| a.cmp(b))
     }
 
+    fn count_not_smaller_than(&self, min_size: usize) -> usize {
+        self.relations
+            .binary_search_by(|relation| {
+                if relation.len() >= min_size {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            })
+            .unwrap_err()
+    }
+
     /// Adds a relation to this model if it is not a subset of an existing relation, and removes
     /// relations which are a subset of this one.
     ///
@@ -583,11 +595,7 @@ impl<V: VariableId> Model<V> {
         // A relation of only one variable can't get any simpler, but any other relation in this
         // model is fair game. If all the relations are single-variable, this is the independence
         // model and has no simpler models.
-        let models = self
-            .relations
-            .iter()
-            .rposition(|relation| relation.0.len() > 1)
-            .map_or(0, |index| index + 1);
+        let models = self.count_not_smaller_than(2);
 
         (0..models).into_iter().map(move |simplify_at| {
             // Copy all the relations except our current simplification target into a new model.
@@ -848,12 +856,9 @@ impl<V: VariableId> Model<V> {
                         // find the last relation that is big enough to keep using. Note that
                         // removing a relation can't break Model's invariant that no relation is a
                         // subset of any other.
-                        commons.relations.truncate(
-                            commons
-                                .iter()
-                                .take_while(|common| common.len() >= min_size)
-                                .count(),
-                        );
+                        commons
+                            .relations
+                            .truncate(commons.count_not_smaller_than(min_size));
                         !commons.relations.is_empty()
                     }
                 });
