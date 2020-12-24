@@ -142,7 +142,7 @@ impl<V: VariableId> VariableSet<V> {
     /// assert!(!one.is_subset(&nil));
     /// ```
     pub fn is_subset(&self, other: &Self) -> bool {
-        self.len() <= other.len() && self.iter().intersection(other.iter()).eq(self.iter())
+        self.len() <= other.len() && self.iter().difference(other.iter()).next().is_none()
     }
 
     /// Returns `true` if `self` contains every variable that `other` does.
