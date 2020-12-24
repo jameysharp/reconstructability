@@ -26,7 +26,7 @@ use sorted_iter::sorted_iterator::SortedByItem;
 use sorted_iter::{multiway_union, SortedIterator, SortedPairIterator};
 use statrs::distribution::{ChiSquared, Univariate};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::LN_2;
 use std::iter;
 use std::mem::{replace, swap};
@@ -159,21 +159,6 @@ impl<V: VariableId> VariableSet<V> {
     /// ```
     pub fn is_superset(&self, other: &Self) -> bool {
         other.is_subset(self)
-    }
-
-    /// Returns an iterator over every subset of this variable set that has one less variable in
-    /// it.
-    fn remove_one_variable(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = Self> + ExactSizeIterator + iter::FusedIterator + '_ {
-        // Working from the end backward produces the subsets in lexicographic order, which reduces
-        // copying if all of these subsets are added to a model.
-        (0..self.len()).rev().map(move |remove_idx| {
-            let mut selected = VariableSet(SmallVec::with_capacity(self.len() - 1));
-            selected.0.extend_from_slice(&self.0[..remove_idx]);
-            selected.0.extend_from_slice(&self.0[remove_idx + 1..]);
-            selected
-        })
     }
 }
 
@@ -596,17 +581,104 @@ impl<V: VariableId> Model<V> {
         // model and has no simpler models.
         let models = self.count_not_smaller_than(2);
 
-        (0..models).into_iter().map(move |simplify_at| {
-            // Copy all the relations except our current simplification target into a new model.
+        // Each less-complex model is produced by removing a different relation and simplifying it.
+        (0..models).map(move |simplify_at| {
             let mut model = Model::new();
-            let (before, after) = self.relations.split_at(simplify_at);
-            let (removed, after) = after.split_first().unwrap();
-            model.relations.extend_from_slice(before);
-            model.relations.extend_from_slice(after);
+            let removed = &self.relations[simplify_at];
 
-            for reduced in removed.remove_one_variable() {
-                model.add_relation(reduced);
+            // The new model will have all the relations of the existing one, aside from the
+            // simplification target, plus potentially as many relations as there are variables in
+            // the target.
+            let max_len = self.relations.len() - 1 + removed.len();
+            model.relations.reserve_exact(max_len);
+
+            // If removing some variable from the target yields a set which is a subset of some
+            // other relation, then we must not add that set to the simplified model. Keep a set of
+            // such variables.
+            let mut excluded = HashSet::with_capacity(removed.len());
+
+            // Only relations which are at least as big as the target can share a one variable
+            // smaller subset with the target. Everything before the target is at least as big, and
+            // some relations after it may be too.
+            let before = self.relations[..simplify_at].iter();
+            let after = self.relations[simplify_at + 1..]
+                .iter()
+                .take_while(|relation| relation.len() >= removed.len());
+
+            for relation in before.chain(after) {
+                // Removing a variable from the target produces a new relation which is smaller
+                // than the target, so we can copy everything that's at least as big before
+                // starting to generate the new subsets.
+                model.relations.push(relation.clone());
+
+                // If you remove the elements in A-B from A, then the result is a subset of B. So
+                // if the set difference has exactly one variable, then removing that one variable
+                // from the target would yield a subset of this relation and therefore we shouldn't
+                // do that.
+                let mut subset_except = removed.iter().difference(relation.iter());
+
+                // Since no relation is a subset of any other, the set-difference between two
+                // relations in the same model must always be non-empty.
+                let v = subset_except.next().unwrap();
+
+                // HashSet::contains is expected O(1), but checking that we've reached the end of
+                // the iterator may require examining the entirety of both relations, which is
+                // O(n). Do the quick check first.
+                if !excluded.contains(&v) && subset_except.next().is_none() {
+                    excluded.insert(v);
+
+                    // If every one variable smaller subset is already contained in some other
+                    // relation, we just need to remove the target and copy everything else.
+                    if excluded.len() == removed.len() {
+                        let mut done = model.relations.len();
+                        if done < simplify_at {
+                            model
+                                .relations
+                                .extend_from_slice(&self.relations[done..simplify_at]);
+                            done = simplify_at;
+                        }
+                        model
+                            .relations
+                            .extend_from_slice(&self.relations[done + 1..]);
+
+                        debug_assert!(model.relations.len() <= max_len);
+                        return model;
+                    }
+                }
             }
+
+            let mut rest = self.relations[model.relations.len() + 1..]
+                .iter()
+                .cloned()
+                .peekable();
+
+            // Working from the end backward produces the subsets in lexicographic order, and since
+            // they're all the same length, this matches the sort order of Model::sort_by.
+            let mut new = (0..removed.len())
+                .rev()
+                .filter_map(move |remove_idx| {
+                    if !excluded.contains(&removed.0[remove_idx]) {
+                        let mut selected = VariableSet(SmallVec::with_capacity(removed.len() - 1));
+                        selected.0.extend_from_slice(&removed.0[..remove_idx]);
+                        selected.0.extend_from_slice(&removed.0[remove_idx + 1..]);
+                        Some(selected)
+                    } else {
+                        None
+                    }
+                })
+                .peekable();
+
+            while let (Some(x), Some(y)) = (rest.peek(), new.peek()) {
+                match Model::sort_by(x, y) {
+                    Ordering::Less => model.relations.push(rest.next().unwrap()),
+                    Ordering::Greater => model.relations.push(new.next().unwrap()),
+                    Ordering::Equal => unreachable!(),
+                }
+            }
+            model.relations.extend(new);
+            model.relations.extend(rest);
+
+            debug_assert!(model.relations.len() <= max_len);
             model
         })
     }
