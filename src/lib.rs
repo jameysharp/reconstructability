@@ -1053,9 +1053,21 @@ impl<V: VariableId> Model<V> {
             // that list every time the candidate outgrows some of them. If that list is now empty
             // then this is a valid candidate.
             if supersets.is_empty() {
-                let mut model = self.clone();
-                model.add_relation(relation);
-                debug_assert!(&model != self);
+                let mut model = Model::new();
+                let insert_at = self
+                    .relations
+                    .binary_search_by(|probe| Model::sort_by(probe, &relation))
+                    .unwrap_err();
+                let (before, after) = self.relations.split_at(insert_at);
+                model.relations.extend_from_slice(before);
+                // Insert an empty placeholder because we need to keep looking at the new relation
+                // while writing all the later relations into the new model, so it's better not to
+                // put it somewhere that could get moved midway through.
+                model.relations.push(VariableSet::new(&[]));
+                model
+                    .relations
+                    .extend(after.iter().filter(|r| !r.is_subset(&relation)).cloned());
+                model.relations[insert_at] = relation;
                 Some(model)
             } else {
                 None
