@@ -756,6 +756,17 @@ impl<V: VariableId> Model<V> {
             iter::from_fn(move || Some((iter.next()?, iter.clone())))
         }
 
+        fn after_subset<'a, V: Ord>(mut variables: &'a [V], subset: &[V]) -> Option<&'a [V]> {
+            for v in subset {
+                if let Ok(pos) = variables.binary_search(v) {
+                    variables = &variables[pos + 1..];
+                } else {
+                    return None;
+                }
+            }
+            Some(variables)
+        }
+
         #[derive(Debug)]
         struct Candidates<V: VariableId> {
             candidates: HashMap<VariableSet<V>, Model<V>>,
@@ -844,7 +855,7 @@ impl<V: VariableId> Model<V> {
                         let b = key.0[1];
                         if common.len() >= 2 {
                             pairs
-                                .entry((a, b))
+                                .entry([a, b])
                                 .or_insert_with(Model::new)
                                 .add_relation(common.clone());
                         }
@@ -905,21 +916,37 @@ impl<V: VariableId> Model<V> {
         // Now we have our initial candidates and the variable-pairs we're going to try to grow
         // them with.
 
+        let mut earliest = candidates.earliest;
+        let possible_supersets = &self.relations[..self.count_not_smaller_than(2)];
+        let mut candidates = candidates
+            .candidates
+            .into_iter()
+            .map(|(key, commons)| {
+                let supersets = possible_supersets
+                    .iter()
+                    .filter_map(|r| after_subset(&r.0, &key.0))
+                    .collect::<Vec<_>>();
+                (key, commons, supersets)
+            })
+            .collect::<Vec<_>>();
+
+        let mut pairs = pairs.into_iter().collect::<Vec<_>>();
+
         let mut min_size = 2;
-        let mut temp_model = None;
         iter::from_fn(move || {
-            if candidates.candidates.is_empty() {
+            if candidates.is_empty() {
                 // There's nothing to extend and nothing to report, so we're done.
                 return None;
             }
 
-            if let Some(earliest) = candidates.earliest {
+            if let Some(earliest) = earliest {
                 // We can prove some of the pairs are unreachable from the current candidates...
-                pairs.retain(|(a, _), commons| {
+                for i in (0..pairs.len()).rev() {
+                    let ([a, _], commons) = &mut pairs[i];
                     if *a < earliest {
                         // ...either because this pair's key is smaller than the smallest variable
                         // we might use as a lookup key...
-                        false
+                        pairs.swap_remove(i);
                     } else {
                         // ...or because the current candidates can't be a subset of this pair's
                         // common variables because all the candidates are bigger. Since the
@@ -930,88 +957,107 @@ impl<V: VariableId> Model<V> {
                         commons
                             .relations
                             .truncate(commons.count_not_smaller_than(min_size));
-                        !commons.relations.is_empty()
+                        if commons.relations.is_empty() {
+                            pairs.swap_remove(i);
+                        }
                     }
-                });
+                }
             } else {
                 // If, the last time we constructed a set of candidates, there were no common sets
-                // to get a minimum variable from, then no pair is reachable: the commons.iter()
-                // loop below won't run for any candidate and so pairs.get() will never be called.
+                // to get a minimum variable from, then no pair is reachable: valid_key will never
+                // become true and the various pair_commons won't be examined.
                 pairs.clear();
             }
 
             if pairs.is_empty() {
-                // If pairs.get() would always return None then the below loop is a no-op.
-                // Short-circuit the outer loop and just return what we have now.
-                return Some(replace(&mut candidates, Candidates::new()).candidates);
+                // In this case, the inner loop will never run. Short-circuit the outer loop and
+                // just return what we have now.
+                return Some(replace(&mut candidates, Vec::new()));
             }
-
-            // The smaller this HashMap is, the more likely it is to fit in cache. So if the above
-            // pruning removed enough entries that the table can fit in fewer hash buckets, then
-            // it's worth reallocating it. Also, this seems to be the only way to rehash away any
-            // deleted entries, which could otherwise lead to more hash probes than expected.
-            pairs.shrink_to_fit();
 
             // Now just smash together every combination of an existing candidate and a pair of
             // variables from any of its common sets.
-            let mut next = Candidates::new();
-            for (key, commons) in candidates.candidates.iter() {
+            let mut next = Vec::new();
+            for (key, key_commons, supersets) in candidates.iter() {
                 // Each set of candidates contains both odd- and even-length keys, of length either
                 // min_size or min_size+1.
                 debug_assert_eq!(key.len() & !1, min_size);
 
-                // This key may represent candidates from multiple different subsets of the
-                // relations. Although they're all the same in the sense that they're missing
-                // exactly one variable each from key, the other variables that they share may
-                // vary.
-                for common in commons.iter() {
-                    for (a, variables) in combinations(common.iter()) {
-                        debug_assert!(*key.0.last().unwrap() < a);
-                        for (b, variables) in combinations(variables) {
-                            debug_assert!(a < b);
-                            if let Some(pair) = pairs.get(&(a, b)) {
-                                for other in pair.iter() {
-                                    // key+{a,b} is only a valid candidate if at least one of the
-                                    // common sets for the pair {a,b} has key as a subset: key
-                                    // represents our current choice of missing-exactly-once
-                                    // variables, so we can only add more if the target pair of
-                                    // relations is not missing any of those variables.
-                                    if key.is_subset(other) {
-                                        let mut new_key = key.clone();
-                                        new_key.0.push(a);
-                                        new_key.0.push(b);
-                                        next.add(
-                                            new_key,
-                                            variables.clone().intersection(other.iter()).collect(),
-                                        );
-                                    }
+                for (pair, pair_commons) in pairs.iter() {
+                    let mut valid_key = false;
+                    let key_commons = key_commons
+                        .iter()
+                        .filter_map(|r| {
+                            if let Some(rest) = after_subset(&r.0, pair) {
+                                valid_key = true;
+                                if rest.len() >= 2 {
+                                    return Some(rest);
+                                }
+                            }
+                            None
+                        })
+                        .collect::<Vec<_>>();
+
+                    if !valid_key {
+                        continue;
+                    }
+
+                    let mut new_commons = Model::new();
+
+                    let mut valid_pair = false;
+                    for pair_common in pair_commons.iter() {
+                        if key.is_subset(pair_common) {
+                            valid_pair = true;
+                            for key_common in key_commons.iter() {
+                                let new_common: VariableSet<_> = key_common
+                                    .iter()
+                                    .copied()
+                                    .assume_sorted_by_item()
+                                    .intersection(pair_common.iter())
+                                    .collect();
+                                if new_common.len() >= 2 {
+                                    new_commons.add_relation(new_common);
                                 }
                             }
                         }
+                    }
+
+                    if valid_pair {
+                        let mut new_key = key.clone();
+                        new_key.0.extend_from_slice(pair);
+                        for common in new_commons.iter() {
+                            if earliest.is_none() || earliest > common.0.first().copied() {
+                                earliest = common.0.first().copied();
+                            }
+                        }
+                        let new_supersets = supersets
+                            .iter()
+                            .filter_map(|r| after_subset(r, pair))
+                            .collect::<Vec<_>>();
+                        next.push((new_key, new_commons, new_supersets));
                     }
                 }
             }
 
             min_size += 2;
-            Some(replace(&mut candidates, next).candidates)
+            Some(replace(&mut candidates, next))
         })
         .flatten()
-        .filter_map(move |(relation, _)| {
+        .filter_map(move |(relation, _, supersets)| {
             // The above iterators guarantee to generate each candidate relation exactly once, but
             // they'll also generate candidates which are already subsets of existing relations. In
             // that case, adding the relation will leave the model unchanged, so the result is
             // obviously not more complex than the original.
             //
-            // The easy way to check this condition is to clone self, try adding the relation, and
-            // see if the clone didn't change. If it didn't change, though, we can save the clone
-            // and use it again for the next relation. That way there is always at most one
-            // unnecessary clone allocated.
-            let mut model = temp_model.take().unwrap_or_else(|| self.clone());
-            model.add_relation(relation);
-            if &model != self {
+            // For each candidate, we've kept track of which relations it's a subset of, pruning
+            // that list every time the candidate outgrows some of them. If that list is now empty
+            // then this is a valid candidate.
+            if supersets.is_empty() {
+                let mut model = self.clone();
+                model.add_relation(relation);
+                debug_assert!(&model != self);
                 Some(model)
             } else {
-                temp_model = Some(model);
                 None
             }
         })
